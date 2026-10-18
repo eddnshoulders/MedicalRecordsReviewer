@@ -1,0 +1,53 @@
+{
+  "events": [
+    {
+      "event_type": "symptom",
+      "treatment": "",
+      "source_quote": "Alex reports a dry cough and mild fever for three days.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    },
+    {
+      "event_type": "symptom",
+      "treatment": "",
+      "source_quote": "Temperature 38.1 C; oxygen saturation 98% on room air.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    },
+    {
+      "event_type": "symptom",
+      "treatment": "",
+      "source_quote": "No shortness of breath or chest pain.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    },
+    {
+      "event_type": "assessment",
+      "treatment": "",
+      "source_quote": "Assessment: likely viral upper respiratory infection.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    },
+    {
+      "event_type": "treatment",
+      "treatment": "No antibiotics prescribed.",
+      "source_quote": "No antibiotics prescribed.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    },
+    {
+      "event_type": "advice",
+      "treatment": "",
+      "source_quote": "Advice: rest, fluids and paracetamol as needed. Seek review if breathing worsens or fever persists beyond five days.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    },
+    {
+      "event_type": "care",
+      "treatment": "",
+      "source_quote": "Fit note issued for two days.",
+      "date_as_written": null,
+      "date_basis": "explicit"
+    }
+  ]
+}

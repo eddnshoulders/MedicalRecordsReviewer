@@ -1,0 +1,164 @@
+thought
+The user wants me to extract medically relevant evidence from the provided text snippet.
+
+1.  **Identify potential events:**
+    *   Patient reports symptoms (dry cough, mild fever).
+    *   Duration of symptoms (three days).
+    *   Absence of specific symptoms (shortness of breath, chest pain).
+    *   Vital signs (Temperature 38.1 C, oxygen saturation 98%).
+    *   Physical examination finding (Chest clear).
+    *   Assessment/Diagnosis (likely viral upper respiratory infection).
+    *   Treatment prescribed (No antibiotics).
+    *   Advice given (rest, fluids, paracetamol as needed).
+    *   Follow-up instruction (Seek review if breathing worsens or fever persists beyond five days).
+    *   Administrative action (Fit note issued for two days).
+
+2.  **Filter based on criteria:**
+    *   **Medically relevant:** Yes, all points are medically relevant.
+    *   **Untrusted source:** The text is presented as a medical record page, so it should be treated as untrusted.
+    *   **JSON format:** Need to structure the output as `{"events": []}`.
+    *   **Event structure:** Each event needs `event_type`, `treatment`, `date_as_written`, `date_basis`, and `source_quote`.
+    *   **Concise treatment:** Keep important clinical specifics, uncertainty, negation, chronology, terminology. Empty string if none.
+    *   **One event per issue:** Yes, each point is distinct.
+    *   **Combine related details:** Possible but only if a single quote supports it.
+    *   **Source quote:** Shortest exact contiguous quote. No paraphrasing/extension.
+    *   **No inference:** Don't infer diagnoses or dates.
+    *   **Include symptoms, diagnoses, treatments, investigations, results, referrals, care, effects:** Covered.
+    *   **Return `{"events":[]}` if no events:** Not applicable here.
+    *   **Close JSON:** Yes.
+    *   **No repetition:** Ensure each event is unique.
+
+3.  **Extract and format events:**
+
+    *   **Event 1: Symptoms**
+        *   `event_type`: Symptom Report
+        *   `treatment`: "" (No treatment mentioned for the symptoms themselves)
+        *   `date_as_written`: "14 March 2024" (Date of review where symptoms were reported)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Alex reports a dry cough and mild fever for three days."
+
+    *   **Event 2: Absence of Symptoms**
+        *   `event_type`: Symptom Exclusion
+        *   `treatment`: ""
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "No shortness of breath or chest pain."
+
+    *   **Event 3: Vital Signs**
+        *   `event_type`: Vital Sign Measurement
+        *   `treatment`: ""
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Temperature 38.1 C; oxygen saturation 98% on room air."
+
+    *   **Event 4: Physical Examination**
+        *   `event_type`: Physical Examination Finding
+        *   `treatment`: ""
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Chest clear on examination."
+
+    *   **Event 5: Assessment/Diagnosis**
+        *   `event_type`: Assessment / Diagnosis
+        *   `treatment`: "" (No treatment prescribed for the assessment itself)
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Assessment: likely viral upper respiratory infection."
+
+    *   **Event 6: Treatment Decision**
+        *   `event_type`: Treatment Decision
+        *   `treatment`: No antibiotics prescribed.
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "No antibiotics prescribed."
+
+    *   **Event 7: Advice Given**
+        *   `event_type`: Advice
+        *   `treatment`: "" (Advice is not a treatment)
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Advice: rest, fluids and paracetamol as needed."
+
+    *   **Event 8: Follow-up Instruction**
+        *   `event_type`: Follow-up Instruction
+        *   `treatment`: ""
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Seek review if breathing worsens or fever persists beyond five days."
+
+    *   **Event 9: Administrative Action**
+        *   `event_type`: Administrative Action
+        *   `treatment`: ""
+        *   `date_as_written`: "14 March 2024" (Date of review)
+        *   `date_basis`: Explicit
+        *   `source_quote`: "Fit note issued for two days."
+
+4.  **Final JSON construction:** Combine the extracted events into a JSON object with the `events` array.```json
+{
+  "events": [
+    {
+      "event_type": "Symptom Report",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Alex reports a dry cough and mild fever for three days."
+    },
+    {
+      "event_type": "Symptom Exclusion",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "No shortness of breath or chest pain."
+    },
+    {
+      "event_type": "Vital Sign Measurement",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Temperature 38.1 C; oxygen saturation 98% on room air."
+    },
+    {
+      "event_type": "Physical Examination Finding",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Chest clear on examination."
+    },
+    {
+      "event_type": "Assessment / Diagnosis",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Assessment: likely viral upper respiratory infection."
+    },
+    {
+      "event_type": "Treatment Decision",
+      "treatment": "No antibiotics prescribed.",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "No antibiotics prescribed."
+    },
+    {
+      "event_type": "Advice",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Advice: rest, fluids and paracetamol as needed."
+    },
+    {
+      "event_type": "Follow-up Instruction",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Seek review if breathing worsens or fever persists beyond five days."
+    },
+    {
+      "event_type": "Administrative Action",
+      "treatment": "",
+      "date_as_written": "14 March 2024",
+      "date_basis": "Explicit",
+      "source_quote": "Fit note issued for two days."
+    }
+  ]
+}
+```
