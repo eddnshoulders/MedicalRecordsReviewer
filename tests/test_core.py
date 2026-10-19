@@ -31,6 +31,61 @@ class PipelineTests(unittest.TestCase):
                 text=texts[page['number']]
                 db.execute("INSERT INTO transcriptions(page_id,job_id,model,text,status,error,image_hash,created) VALUES(?,NULL,'mock',?,'complete',NULL,NULL,?)",(page['id'],text,core.now()))
 
+    def test_model_context_settings_are_persisted(self):
+        app.save_model_context_settings(app.ModelContextSettings(ocr=32768,evidence=16384,medgemma=24576,embedding=4096))
+        self.assertEqual(app.model_context_settings()['contexts'],{'ocr':32768,'evidence':16384,'medgemma':24576,'embedding':4096})
+
+    def test_multimodal_extraction_content_includes_page_image(self):
+        image=Path(self.temp.name)/'page.png'
+        image.write_bytes(b'fake png bytes')
+        content=core.multimodal_user_content('Extract events.',image)
+        self.assertEqual(content[0]['type'],'text')
+        self.assertIn('Extract events.',content[0]['text'])
+        self.assertEqual(content[1]['type'],'image_url')
+        self.assertTrue(content[1]['image_url']['url'].startswith('data:image/png;base64,'))
+
+    def test_page_image_button_only_flags_next_normal_stage_run(self):
+        did=core.ingest(self.pdf)
+        with core.connect() as db:
+            page=db.execute('SELECT id FROM pages WHERE document_id=? AND number=1',(did,)).fetchone()
+            db.execute("INSERT INTO transcriptions(page_id,model,text,status,created) VALUES(?,'mock','OCR text','complete',?)",(page['id'],core.now()))
+            jobs_before=db.execute('SELECT count(*) FROM jobs').fetchone()[0]
+        app.set_page_image_input(page['id'],app.PageImageFlag(stage='medgemma',enabled=True))
+        with core.connect() as db:
+            saved=db.execute('SELECT medgemma_use_image,nuextract_use_image FROM pages WHERE id=?',(page['id'],)).fetchone()
+            jobs_after=db.execute('SELECT count(*) FROM jobs').fetchone()[0]
+        self.assertEqual(tuple(saved),(1,0))
+        self.assertEqual(jobs_before,jobs_after)
+        self.assertTrue(core.page_uses_image('medgemma',saved))
+        self.assertFalse(core.page_uses_image('evidence',saved))
+
+    def test_page_stage_clear_only_removes_selected_pages_stage_data(self):
+        did=core.ingest(self.pdf)
+        self.add_ocr(did)
+        with core.connect() as db:
+            pages=db.execute('SELECT id FROM pages WHERE document_id=? ORDER BY number',(did,)).fetchall()
+            nu=db.execute("INSERT INTO jobs(document_id,status,model,created,kind) VALUES(?,?,?,?, 'evidence')",(did,'complete','mock',core.now())).lastrowid
+            med=db.execute("INSERT INTO jobs(document_id,status,model,created,kind) VALUES(?,?,?,?, 'medgemma')",(did,'complete','mock',core.now())).lastrowid
+            runs={}
+            for page in pages:
+                runs[(page['id'],'evidence')]=db.execute("INSERT INTO runs(job_id,page_id,model,output,status,created) VALUES(?,?,?,'{}','complete',?)",(nu,page['id'],'mock',core.now())).lastrowid
+                runs[(page['id'],'medgemma')]=db.execute("INSERT INTO runs(job_id,page_id,model,output,status,created) VALUES(?,?,?,'{}','complete',?)",(med,page['id'],'mock',core.now())).lastrowid
+            db.execute("INSERT INTO evidence(run_id,page_id,payload,quote) VALUES(?,?, '{}','q')",(runs[(pages[0]['id'],'evidence')],pages[0]['id']))
+            db.execute("INSERT INTO evidence(run_id,page_id,payload,quote) VALUES(?,?, '{}','q')",(runs[(pages[1]['id'],'evidence')],pages[1]['id']))
+        core.clear_page_stage_data(pages[0]['id'],'nuextract')
+        with core.connect() as db:
+            self.assertIsNone(db.execute('SELECT id FROM runs WHERE job_id=? AND page_id=?',(nu,pages[0]['id'])).fetchone())
+            self.assertIsNotNone(db.execute('SELECT id FROM runs WHERE job_id=? AND page_id=?',(nu,pages[1]['id'])).fetchone())
+            self.assertIsNotNone(db.execute('SELECT id FROM runs WHERE job_id=? AND page_id=?',(med,pages[0]['id'])).fetchone())
+            self.assertEqual(db.execute('SELECT count(*) FROM evidence WHERE page_id=?',(pages[0]['id'],)).fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT count(*) FROM evidence WHERE page_id=?',(pages[1]['id'],)).fetchone()[0],1)
+        core.clear_page_stage_data(pages[0]['id'],'ocr')
+        with core.connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM transcriptions WHERE page_id=?',(pages[0]['id'],)).fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT count(*) FROM runs WHERE page_id=?',(pages[0]['id'],)).fetchone()[0],0)
+            self.assertIsNotNone(db.execute('SELECT id FROM transcriptions WHERE page_id=?',(pages[1]['id'],)).fetchone())
+            self.assertIsNotNone(db.execute('SELECT id FROM runs WHERE job_id=? AND page_id=?',(nu,pages[1]['id'])).fetchone())
+
     def test_ingestion_deduplicates_and_flags_scan(self):
         before = self.pdf.read_bytes()
         first = core.ingest(self.pdf)
@@ -94,6 +149,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(tuple(evidence),('Haemoglobin',1,'readable_table',None))
         self.assertEqual(run['status'],'complete')
         self.assertEqual(len(json.loads(run['output'])['events']),1)
+
+    def test_ocr_saves_compacted_table_text_beside_original_transcription(self):
+        did=core.ingest(self.pdf)
+        table='<table><tr><th>Test</th><th>Result</th></tr><tr><td>Factor VIII</td><td>12 IU/dL</td></tr></table>'
+        with core.connect() as db:
+            jid=db.execute("INSERT INTO jobs(document_id,status,model,created,kind) VALUES(?,?,?,?,?)",(did,'queued','lighton-test',core.now(),'ocr')).lastrowid
+        core.ocr(jid,lambda model,path:table if path.name=='1.png' else 'Plain OCR text')
+        with core.connect() as db:
+            row=db.execute("SELECT text,compacted_text FROM transcriptions WHERE page_id=(SELECT id FROM pages WHERE document_id=? AND number=1) AND status='complete' ORDER BY id DESC LIMIT 1",(did,)).fetchone()
+        self.assertEqual(row['text'],table)
+        self.assertNotIn('<td>',row['compacted_text'])
+        self.assertIn('Test: Factor VIII | Result: 12 IU/dL',row['compacted_text'])
 
     def test_init_completes_old_fully_processed_jobs_with_quote_warnings(self):
         did=core.ingest(self.pdf)
@@ -265,6 +332,26 @@ class PipelineTests(unittest.TestCase):
             run=db.execute('SELECT input_tokens,output_tokens,finish_reason FROM runs WHERE job_id=? AND status=\'complete\' ORDER BY id LIMIT 1',(jid,)).fetchone()
         self.assertEqual(tuple(run),(1876,9,'stop'))
 
+    def test_page_scoped_extraction_only_processes_target_page(self):
+        did=core.ingest(self.pdf)
+        self.add_ocr(did)
+        with core.connect() as db:
+            page=db.execute('SELECT id,number FROM pages WHERE document_id=? ORDER BY number LIMIT 1',(did,)).fetchone()
+            jid=db.execute('INSERT INTO jobs(document_id,status,model,created,provider,kind,target_page_id) VALUES(?,?,?,?,?,?,?)',(did,'queued','mock',core.now(),'lmstudio','evidence',page['id'])).lastrowid
+        calls=[]
+        core.extract(jid,lambda model,prompt:(calls.append(prompt) or '{"events":[]}'))
+        with core.connect() as db:
+            rows=db.execute('SELECT p.number FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=?',(jid,)).fetchall()
+            job=db.execute('SELECT total_pages,completed_pages FROM jobs WHERE id=?',(jid,)).fetchone()
+        self.assertEqual([row['number'] for row in rows],[page['number']])
+        self.assertEqual((job['total_pages'],job['completed_pages']),(1,1))
+        self.assertEqual(len(calls),1)
+        progress=next(document for document in app.dataset() if document['id']==did)
+        self.assertEqual((progress['evidence_completed_pages'],progress['evidence_total_pages'],progress['evidence_status']),(1,2,'pending'))
+        core.clear_page_stage_data(page['id'],'nuextract')
+        progress=next(document for document in app.dataset() if document['id']==did)
+        self.assertEqual((progress['evidence_completed_pages'],progress['evidence_total_pages']),(0,2))
+
     def test_output_limit_stops_extraction_before_later_pages(self):
         three_page_pdf=Path(self.temp.name)/'three-pages.pdf'
         document=fitz.open(self.pdf)
@@ -313,6 +400,24 @@ class PipelineTests(unittest.TestCase):
             job=db.execute('SELECT status,error FROM jobs WHERE id=?',(jid,)).fetchone()
         self.assertEqual(job['status'],'needs_attention')
         self.assertIn('Continued after finish_reason=length on page(s) 2',job['error'])
+
+    def test_stop_request_interrupts_after_current_page_and_retains_completed_page(self):
+        did=core.ingest(self.pdf)
+        self.add_ocr(did)
+        with core.connect() as db:
+            jid=db.execute("INSERT INTO jobs(document_id,status,model,created,kind) VALUES(?,?,?,?,?)",(did,'queued','mock',core.now(),'evidence')).lastrowid
+        calls=[]
+        def call(model,prompt):
+            calls.append(prompt)
+            return '{"events":[]}'
+        core.extract(jid,call,stop_requested=lambda:len(calls)>0)
+        self.assertEqual(len(calls),1)
+        with core.connect() as db:
+            job=db.execute('SELECT status,completed_pages,error FROM jobs WHERE id=?',(jid,)).fetchone()
+            rows=db.execute('SELECT p.number,r.status FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=? ORDER BY p.number',(jid,)).fetchall()
+        self.assertEqual((job['status'],job['completed_pages']),('interrupted',1))
+        self.assertIn('Stopped by user',job['error'])
+        self.assertEqual([tuple(row) for row in rows],[(1,'complete')])
 
     def test_malformed_output_rejected(self):
         for output in ['not json','{}','{"events":[{}]}']:

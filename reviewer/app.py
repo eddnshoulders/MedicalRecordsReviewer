@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import core
 
 lock = threading.Lock()
+stop_event = threading.Event()
 lm_startup_status={'available':False,'models':[],'error':'Not checked yet.'}
 
 @asynccontextmanager
@@ -47,8 +48,29 @@ class Import(BaseModel):
     password: str = ''
     register_only: bool = False
 
+class ImportRoot(BaseModel):
+    path: str
+
+class ModelContextSettings(BaseModel):
+    ocr: int = Field(default=16384, ge=512, le=1048576)
+    evidence: int = Field(default=8192, ge=512, le=1048576)
+    medgemma: int = Field(default=16384, ge=512, le=1048576)
+    embedding: int = Field(default=8192, ge=512, le=1048576)
+
+class PickerRequest(BaseModel):
+    initialdir: str = ''
+
 class Extraction(BaseModel):
     document_id: str
+    model: str
+    stop_on_output_limit: bool = True
+
+class PageImageFlag(BaseModel):
+    stage: str
+    enabled: bool
+
+class PageWorkflow(BaseModel):
+    stage: str
     model: str
     stop_on_output_limit: bool = True
 
@@ -120,7 +142,7 @@ def incomplete_stage_job(db, document_id, kind):
     """Return the latest unfinished LM Studio job for this stage, if any."""
     kind_clause="(kind=? OR (kind IS NULL AND ?='evidence'))"
     row=db.execute(f'''SELECT id,model,status,stop_on_output_limit FROM jobs
-        WHERE document_id=? AND provider='lmstudio' AND {kind_clause}
+        WHERE document_id=? AND target_page_id IS NULL AND provider='lmstudio' AND {kind_clause}
           AND status IN ('needs_attention','interrupted','failed')
         ORDER BY id DESC LIMIT 1''',(document_id,kind,kind)).fetchone()
     return row
@@ -129,7 +151,13 @@ def incomplete_stage_job(db, document_id, kind):
 def transcriptions(page_id: str):
     with core.connect() as db:
         latest=db.execute("SELECT id FROM transcriptions WHERE page_id=? AND status='complete' ORDER BY id DESC LIMIT 1",(page_id,)).fetchone()
-        return {'versions':[dict(r) for r in db.execute('SELECT * FROM transcriptions WHERE page_id=? ORDER BY id DESC',(page_id,))], 'latest_transcription_id':latest['id'] if latest else None}
+        versions=[dict(r) for r in db.execute('SELECT * FROM transcriptions WHERE page_id=? ORDER BY id DESC',(page_id,))]
+        for version in versions:
+            if version['status']=='complete' and version['compacted_text'] is None:
+                compacted,changed=core.readable_extraction_source(version['text'] or '')
+                if changed:
+                    version['compacted_text']=compacted
+        return {'versions':versions, 'latest_transcription_id':latest['id'] if latest else None}
 
 @app.post('/api/pages/{page_id}/ignore')
 def set_page_ignored(page_id: str, data: PageIgnore):
@@ -167,7 +195,8 @@ def edit_transcription(page_id: str, data: TranscriptionEdit):
                 raise HTTPException(404,'Page not found.')
             if page['ignored']:
                 raise HTTPException(409,'Include this page before editing its OCR transcription.')
-            transcription_id=db.execute("INSERT INTO transcriptions(page_id,job_id,model,text,status,error,image_hash,created) VALUES(?,NULL,'manual-edit',?,'complete',NULL,NULL,?)",(page_id,data.text,core.now())).lastrowid
+            compacted_text,has_compacted_tables=core.readable_extraction_source(data.text)
+            transcription_id=db.execute("INSERT INTO transcriptions(page_id,job_id,model,text,status,error,image_hash,created,compacted_text) VALUES(?,NULL,'manual-edit',?,'complete',NULL,NULL,?,?)",(page_id,data.text,core.now(),compacted_text if has_compacted_tables else None)).lastrowid
             core.rebuild_page_search(db)
         return {'saved':True,'transcription_id':transcription_id}
     finally:
@@ -190,22 +219,66 @@ def start_ocr(data: Extraction):
     except Exception:
         lock.release()
         raise
+    stop_event.clear()
     threading.Thread(target=start_job,args=(jid,),daemon=True).start()
     return {'job_id':jid}
 
+@app.get('/api/settings/import-root')
+def import_root_setting():
+    return {'path':core.get_setting('import_top_level_path',str(Path.home()))}
+
+@app.post('/api/settings/import-root')
+def save_import_root(data: ImportRoot):
+    path=Path(data.path).expanduser()
+    if not path.is_absolute():
+        raise HTTPException(400,'Enter an absolute folder path.')
+    path=path.resolve()
+    if not path.is_dir():
+        raise HTTPException(400,'Choose an existing folder as the top-level import path.')
+    core.set_setting('import_top_level_path',str(path))
+    return {'path':str(path)}
+
+@app.get('/api/settings/model-contexts')
+def model_context_settings():
+    return {'contexts':{stage:core.stage_context_length(stage) for stage in ('ocr','evidence','medgemma','embedding')}}
+
+@app.post('/api/settings/model-contexts')
+def save_model_context_settings(data: ModelContextSettings):
+    for stage in ('ocr','evidence','medgemma','embedding'):
+        core.set_setting(f'{stage}_context_length',getattr(data,stage))
+    return model_context_settings()
+
+def _picker_initialdir(value):
+    candidate=Path(value).expanduser() if value else Path(core.get_setting('import_top_level_path',str(Path.home())))
+    return str(candidate.resolve()) if candidate.is_dir() else str(Path.home())
+
 @app.post('/api/select-folder')
-def select_folder():
+def select_folder(data: PickerRequest = PickerRequest()):
     try:
         import tkinter as tk
         from tkinter import filedialog
         root=tk.Tk()
         root.withdraw()
         root.attributes('-topmost',True)
-        folder=filedialog.askdirectory(parent=root,title='Choose a folder of PDFs and image files',mustexist=True)
+        folder=filedialog.askdirectory(parent=root,title='Choose a folder of PDFs and image files',mustexist=True,initialdir=_picker_initialdir(data.initialdir))
         root.destroy()
         return {'folder':folder}
     except Exception as exc:
         raise HTTPException(503,f'Could not open the Windows folder picker: {exc}')
+
+@app.post('/api/select-file')
+def select_file(data: PickerRequest = PickerRequest()):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root=tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost',True)
+        path=filedialog.askopenfilename(parent=root,title='Choose a PDF or image file',initialdir=_picker_initialdir(data.initialdir),filetypes=[('PDF and image files','*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp'),('All files','*.*')])
+        root.destroy()
+        return {'path':path}
+    except Exception as exc:
+        raise HTTPException(503,f'Could not open the Windows file picker: {exc}')
 
 @app.post('/api/batches')
 def start_batch(data: BatchRequest):
@@ -231,6 +304,7 @@ def start_batch(data: BatchRequest):
                 (str(folder),'queued',data.ocr_model,data.evidence_model,data.medgemma_model.strip() or None,core.now(),core.now(),len(files),int(data.stop_on_output_limit))).lastrowid
             db.executemany('INSERT INTO batch_items(batch_id,path,name,status) VALUES(?,?,?,?)',
                 [(batch_id,str(p),p.name,'queued') for p in files])
+        stop_event.clear()
         threading.Thread(target=run_batch,args=(batch_id,),daemon=True).start()
     except Exception:
         lock.release()
@@ -304,11 +378,87 @@ def clear_stage(document_id: str, data: ClearStage):
 def run_selected_stage(jobs):
     try:
         for jid,kind in jobs:
+            if stop_event.is_set():
+                break
             try:
-                (core.ocr if kind=='ocr' else core.extract)(jid)
+                (core.ocr if kind=='ocr' else core.extract)(jid,stop_requested=stop_event.is_set)
             except Exception as exc:
                 with core.connect() as db:
                     core.finish_job(db,jid,'needs_attention',str(exc))
+    finally:
+        if stop_event.is_set():
+            with core.connect() as db:
+                for jid,_ in jobs:
+                    row=db.execute("SELECT status FROM jobs WHERE id=?",(jid,)).fetchone()
+                    if row and row['status']=='queued':
+                        core.finish_job(db,jid,'interrupted','Stopped by user before this file started. Completed data is retained; retry to continue.')
+        stop_event.clear()
+        lock.release()
+
+@app.post('/api/pages/{page_id}/image-input')
+def set_page_image_input(page_id: str,data: PageImageFlag):
+    if data.stage not in ('evidence','medgemma'):
+        raise HTTPException(400,'Choose NuExtract or MedGemma image input.')
+    if not lock.acquire(False):
+        raise HTTPException(409,'Wait for the current processing task to finish before changing image-input settings.')
+    try:
+        with core.connect() as db:
+            page=db.execute('SELECT id,ignored FROM pages WHERE id=?',(page_id,)).fetchone()
+            if not page:
+                raise HTTPException(404,'Page not found.')
+            if page['ignored']:
+                raise HTTPException(409,'Include this page before changing its image-input setting.')
+            column='medgemma_use_image' if data.stage=='medgemma' else 'nuextract_use_image'
+            db.execute(f'UPDATE pages SET {column}=? WHERE id=?',(int(data.enabled),page_id))
+        return {'page_id':page_id,'stage':data.stage,'enabled':data.enabled}
+    finally:
+        lock.release()
+
+@app.post('/api/pages/{page_id}/workflow')
+def workflow_page(page_id: str,data: PageWorkflow):
+    if data.stage not in ('ocr','evidence','nuextract','medgemma'):
+        raise HTTPException(400,'Choose OCR, NuExtract or MedGemma.')
+    kind='evidence' if data.stage in ('evidence','nuextract') else data.stage
+    if not data.model.strip() or 'cloud' in data.model.casefold():
+        raise HTTPException(400,'Choose an installed local model for this stage.')
+    if kind=='ocr':
+        validate_ocr_model(data.model)
+    validate_loaded_model(data.model,{'ocr':'OCR','evidence':'NuExtract','medgemma':'MedGemma'}[kind])
+    if not lock.acquire(False):
+        raise HTTPException(409,'Another processing task is running.')
+    try:
+        with core.connect() as db:
+            page=db.execute('SELECT id,document_id,number,ignored FROM pages WHERE id=?',(page_id,)).fetchone()
+            if not page:
+                raise HTTPException(404,'Page not found.')
+            if page['ignored']:
+                raise HTTPException(409,'Include this page before processing it.')
+            if kind=='ocr':
+                completed=db.execute("SELECT 1 FROM transcriptions WHERE page_id=? AND status='complete' AND model!='manual-edit' LIMIT 1",(page_id,)).fetchone()
+            else:
+                completed=db.execute("SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=? AND r.status='complete' AND (j.kind=? OR (j.kind IS NULL AND ?='evidence')) LIMIT 1",(page_id,kind,kind)).fetchone()
+                if not db.execute("SELECT 1 FROM transcriptions WHERE page_id=? AND status='complete' LIMIT 1",(page_id,)).fetchone():
+                    raise HTTPException(409,'Run OCR successfully for this page before extraction.')
+            if completed:
+                label={'ocr':'OCR','evidence':'NuExtract','medgemma':'MedGemma'}[kind]
+                raise HTTPException(409,f'{label} is already complete for this page. Delete this page’s {label} data before running it again.')
+            jid=db.execute('''INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit,target_page_id)
+                VALUES(?,?,?,?,?,?,?,?)''',(page['document_id'],'queued',data.model,core.now(),'lmstudio',kind,int(data.stop_on_output_limit),page_id)).lastrowid
+        stop_event.clear()
+        threading.Thread(target=run_selected_stage,args=([(jid,kind)],),daemon=True).start()
+        return {'job_id':jid,'page_id':page_id,'stage':data.stage}
+    except Exception:
+        lock.release()
+        raise
+
+@app.post('/api/pages/{page_id}/clear-stage')
+def clear_page_stage(page_id: str,data: ClearStage):
+    if not lock.acquire(False):
+        raise HTTPException(409,'Wait for the current processing task to finish before clearing page data.')
+    try:
+        return core.clear_page_stage_data(page_id,data.stage)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from exc
     finally:
         lock.release()
 
@@ -354,11 +504,22 @@ def workflow_selected(data: SelectedWorkflow):
                 else:
                     jid=db.execute('INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit) VALUES(?,?,?,?,?,?,?)',(document_id,'queued',data.model,core.now(),'lmstudio',kind,int(data.stop_on_output_limit))).lastrowid
                 jobs.append((jid,kind))
+        stop_event.clear()
         threading.Thread(target=run_selected_stage,args=(jobs,),daemon=True).start()
         return {'job_ids':[jid for jid,_ in jobs]}
     except Exception:
         lock.release()
         raise
+
+@app.post('/api/stop')
+def stop_current_task():
+    with core.connect() as db:
+        active_jobs=db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+        active_batches=db.execute("SELECT count(*) FROM batches WHERE status IN ('queued','running')").fetchone()[0]
+    if not active_jobs and not active_batches:
+        raise HTTPException(409,'No processing task is currently running.')
+    stop_event.set()
+    return {'stop_requested':True,'message':'Stop requested. The current LM Studio request will finish; no later page or file will start. Completed page data is retained.'}
 
 @app.post('/api/documents/{document_id}/pages')
 def resume_pages(document_id: str, data: Import):
@@ -382,34 +543,60 @@ def dataset():
             (SELECT count(*) FROM evidence e JOIN pages p ON e.page_id=p.id WHERE p.document_id=d.id AND e.status='unreviewed') AS unreviewed
             ,(SELECT count(DISTINCT r.page_id) FROM runs r JOIN jobs j ON j.id=r.job_id JOIN pages p ON p.id=r.page_id WHERE p.document_id=d.id AND p.ignored=0 AND (j.kind='evidence' OR j.kind IS NULL) AND r.status='complete') AS evidence_data_pages
             ,(SELECT count(DISTINCT r.page_id) FROM runs r JOIN jobs j ON j.id=r.job_id JOIN pages p ON p.id=r.page_id WHERE p.document_id=d.id AND p.ignored=0 AND j.kind='medgemma' AND r.status='complete') AS medgemma_data_pages
-            ,(SELECT j.id FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_job_id
-            ,(SELECT j.status FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_status
-            ,(SELECT j.current_page FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_current_page
-            ,(SELECT j.completed_pages FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_completed_pages
-            ,(SELECT j.total_pages FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_total_pages
-            ,(SELECT j.last_completed_page FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_last_completed_page
-            ,(SELECT j.started_at FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_started_at
-            ,(SELECT j.finished_at FROM jobs j WHERE j.document_id=d.id AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_finished_at
-            ,(SELECT j.id FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_job_id
-            ,(SELECT j.status FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_status
-            ,(SELECT j.current_page FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_current_page
-            ,(SELECT j.completed_pages FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_completed_pages
-            ,(SELECT j.total_pages FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_total_pages
-            ,(SELECT j.last_completed_page FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_last_completed_page
-            ,(SELECT j.started_at FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_started_at
-            ,(SELECT j.finished_at FROM jobs j WHERE j.document_id=d.id AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_finished_at
-            ,(SELECT j.id FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_job_id
-            ,(SELECT j.status FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_status
-            ,(SELECT j.current_page FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_current_page
-            ,(SELECT j.completed_pages FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_completed_pages
-            ,(SELECT j.total_pages FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_total_pages
-            ,(SELECT j.last_completed_page FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_last_completed_page
-            ,(SELECT j.started_at FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_started_at
-            ,(SELECT j.finished_at FROM jobs j WHERE j.document_id=d.id AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_finished_at
+            ,(SELECT j.id FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_job_id
+            ,(SELECT j.status FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_status
+            ,(SELECT j.current_page FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_current_page
+            ,(SELECT j.completed_pages FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_completed_pages
+            ,(SELECT j.total_pages FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_total_pages
+            ,(SELECT j.last_completed_page FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_last_completed_page
+            ,(SELECT j.started_at FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_started_at
+            ,(SELECT j.finished_at FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='ocr' ORDER BY j.id DESC LIMIT 1) AS ocr_finished_at
+            ,(SELECT j.id FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_job_id
+            ,(SELECT j.status FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_status
+            ,(SELECT j.current_page FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_current_page
+            ,(SELECT j.completed_pages FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_completed_pages
+            ,(SELECT j.total_pages FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_total_pages
+            ,(SELECT j.last_completed_page FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_last_completed_page
+            ,(SELECT j.started_at FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_started_at
+            ,(SELECT j.finished_at FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='evidence' ORDER BY j.id DESC LIMIT 1) AS evidence_finished_at
+            ,(SELECT j.id FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_job_id
+            ,(SELECT j.status FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_status
+            ,(SELECT j.current_page FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_current_page
+            ,(SELECT j.completed_pages FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_completed_pages
+            ,(SELECT j.total_pages FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_total_pages
+            ,(SELECT j.last_completed_page FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_last_completed_page
+            ,(SELECT j.started_at FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_started_at
+            ,(SELECT j.finished_at FROM jobs j WHERE j.document_id=d.id AND j.target_page_id IS NULL AND j.kind='medgemma' ORDER BY j.id DESC LIMIT 1) AS medgemma_finished_at
             FROM documents d ORDER BY name''')]
         for document in documents:
+            eligible=db.execute('SELECT count(*) FROM pages WHERE document_id=? AND ignored=0',(document['id'],)).fetchone()[0]
             for kind,key in (('ocr','ocr'),('evidence','evidence'),('medgemma','medgemma')):
                 document[key+'_runtime_seconds']=core.document_stage_runtime(db,document['id'],kind)
+                completed=document['transcribed'] if kind=='ocr' else document['evidence_data_pages'] if kind=='evidence' else document['medgemma_data_pages']
+                document[key+'_completed_pages']=completed
+                document[key+'_total_pages']=eligible
+                failed_sql=("SELECT count(*) FROM pages p WHERE p.document_id=? AND p.ignored=0 AND NOT EXISTS(SELECT 1 FROM transcriptions t WHERE t.page_id=p.id AND t.status='complete') AND EXISTS(SELECT 1 FROM transcriptions t WHERE t.page_id=p.id AND t.status='failed')" if kind=='ocr' else "SELECT count(*) FROM pages p WHERE p.document_id=? AND p.ignored=0 AND NOT EXISTS(SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=p.id AND r.status='complete' AND (j.kind=? OR (j.kind IS NULL AND ?='evidence'))) AND EXISTS(SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=p.id AND r.status='failed' AND (j.kind=? OR (j.kind IS NULL AND ?='evidence')))")
+                failed=db.execute(failed_sql,(document['id'],) if kind=='ocr' else (document['id'],kind,kind,kind,kind)).fetchone()[0]
+                status_key=key+'_status'
+                if kind=='evidence':
+                    active_kind="(kind='evidence' OR kind IS NULL)"
+                else:
+                    active_kind='kind=?'
+                args=(document['id'],) if kind=='evidence' else (document['id'],kind)
+                active=db.execute(f"SELECT current_page FROM jobs WHERE document_id=? AND {active_kind} AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",args).fetchone()
+                if active:
+                    document[status_key]='running'
+                    document[key+'_current_page']=active['current_page']
+                elif failed:
+                    document[status_key]='needs_attention'
+                elif eligible and completed>=eligible:
+                    if document.get(status_key) not in ('needs_attention',):
+                        document[status_key]='complete'
+                elif completed:
+                    if document.get(status_key) not in ('interrupted','failed','needs_attention'):
+                        document[status_key]='pending'
+                elif document.get(status_key) is None and failed:
+                    document[status_key]='needs_attention'
         return documents
 
 @app.get('/api/documents/{document_id}/messages')
@@ -432,7 +619,9 @@ def import_pdf(data: Import):
     if not lock.acquire(False):
         raise HTTPException(409,'Another processing task is running.')
     try:
-        return {'id':core.ingest(data.path,data.password,data.register_only)}
+        # Import always prepares source page images; autoProcess controls only
+        # whether OCR and evidence extraction start afterward.
+        return {'id':core.ingest(data.path,data.password,False)}
     except Exception as exc:
         raise HTTPException(400,str(exc))
     finally:
@@ -451,9 +640,13 @@ def import_folder(data: BatchRequest):
         raise HTTPException(409,'Another processing task is running.')
     try:
         imported=[]
+        errors=[]
         for path in files:
-            imported.append(core.ingest(path,register_only=True))
-        return {'imported':len(imported),'document_ids':imported}
+            try:
+                imported.append(core.ingest(path,register_only=False))
+            except Exception as exc:
+                errors.append({'name':path.name,'error':str(exc)})
+        return {'imported':len(imported),'document_ids':imported,'errors':errors}
     except Exception as exc:
         raise HTTPException(400,str(exc))
     finally:
@@ -509,6 +702,11 @@ def model_contexts(ocr_model: str = '', evidence_model: str = '', medgemma_model
 
 def run_semantic_index(job_id):
     try:
+        with core.connect() as db:
+            job=db.execute('SELECT model FROM semantic_jobs WHERE id=?',(job_id,)).fetchone()
+        if not job:
+            raise ValueError('Semantic indexing job no longer exists.')
+        core.ensure_model_context(job['model'],core.stage_context_length('embedding'))
         core.build_semantic_index(job_id)
     except Exception as exc:
         with core.connect() as db:
@@ -561,17 +759,20 @@ def pages(document_id: str):
                  WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.document_id=p.document_id AND j.kind='ocr' AND j.status='running' AND j.current_page=p.number) THEN 'running'
                  WHEN EXISTS(SELECT 1 FROM transcriptions f WHERE f.page_id=p.id AND f.status='failed' AND f.error LIKE 'Suspected Blank Page%') THEN 'suspected_blank'
                  WHEN EXISTS(SELECT 1 FROM transcriptions f WHERE f.page_id=p.id AND f.status='failed') THEN 'failed'
+                 WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.document_id=p.document_id AND j.kind='ocr' AND j.status='interrupted' AND coalesce(j.error,'') NOT LIKE 'Page data was deleted%' AND (j.target_page_id=p.id OR (j.target_page_id IS NULL AND p.number>coalesce(j.last_completed_page,0)))) THEN 'interrupted'
                  WHEN p.status='failed' THEN 'failed'
                  ELSE 'pending' END AS ocr_progress,
             CASE WHEN p.ignored=1 THEN 'ignored'
                  WHEN EXISTS(SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=p.id AND r.status='complete' AND (j.kind='evidence' OR j.kind IS NULL)) THEN 'complete'
                  WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.document_id=p.document_id AND (j.kind='evidence' OR j.kind IS NULL) AND j.status='running' AND j.current_page=p.number) THEN 'running'
                  WHEN EXISTS(SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=p.id AND r.status='failed' AND (j.kind='evidence' OR j.kind IS NULL)) THEN 'failed'
+                 WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.document_id=p.document_id AND (j.kind='evidence' OR j.kind IS NULL) AND j.status='interrupted' AND coalesce(j.error,'') NOT LIKE 'Page data was deleted%' AND (j.target_page_id=p.id OR (j.target_page_id IS NULL AND p.number>coalesce(j.last_completed_page,0)))) THEN 'interrupted'
                  ELSE 'pending' END AS nuextract_progress,
             CASE WHEN p.ignored=1 THEN 'ignored'
                  WHEN EXISTS(SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=p.id AND j.kind='medgemma' AND r.status='complete') THEN 'complete'
                  WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.document_id=p.document_id AND j.kind='medgemma' AND j.status='running' AND j.current_page=p.number) THEN 'running'
                  WHEN EXISTS(SELECT 1 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=p.id AND j.kind='medgemma' AND r.status='failed') THEN 'failed'
+                 WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.document_id=p.document_id AND j.kind='medgemma' AND j.status='interrupted' AND coalesce(j.error,'') NOT LIKE 'Page data was deleted%' AND (j.target_page_id=p.id OR (j.target_page_id IS NULL AND p.number>coalesce(j.last_completed_page,0)))) THEN 'interrupted'
                  ELSE 'pending' END AS medgemma_progress
             FROM pages p LEFT JOIN transcriptions t ON t.id=(SELECT x.id FROM transcriptions x WHERE x.page_id=p.id AND x.status='complete' ORDER BY x.id DESC LIMIT 1)
                 WHERE p.document_id=? ORDER BY p.number''',(document_id,)).fetchall()
@@ -579,11 +780,12 @@ def pages(document_id: str):
 
 @app.get('/api/image/{page_id}')
 def image(page_id: str):
-    with core.connect() as db:
-        row = db.execute('SELECT image FROM pages WHERE id=?',(page_id,)).fetchone()
-    if not row or not Path(row['image']).is_file():
-        raise HTTPException(404)
-    return FileResponse(row['image'])
+    try:
+        return FileResponse(core.ensure_page_image(page_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(404,str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from exc
 
 @app.get('/api/evidence/{page_id}')
 def evidence(page_id: str):
@@ -607,11 +809,12 @@ def start_job(jid):
     try:
         with core.connect() as db:
             job=db.execute('SELECT kind FROM jobs WHERE id=?',(jid,)).fetchone()
-        (core.ocr if job['kind']=='ocr' else core.extract)(jid)
+        (core.ocr if job['kind']=='ocr' else core.extract)(jid,stop_requested=stop_event.is_set)
     except Exception as exc:
         with core.connect() as db:
             core.finish_job(db,jid,'needs_attention',str(exc))
     finally:
+        stop_event.clear()
         lock.release()
 
 def _append_batch_error(item_id, message):
@@ -635,6 +838,10 @@ def _batch_extraction_result(job_id, item_id, label, candidates_column):
         if not failures and not warnings:
             _append_batch_error(item_id,f'{label} extraction: '+(result['error'] or 'some pages need attention'))
 
+def _check_stop_requested():
+    if stop_event.is_set():
+        raise core.ProcessingStopped()
+
 def run_batch(batch_id):
     try:
         with core.connect() as db:
@@ -646,14 +853,18 @@ def run_batch(batch_id):
         # Prepare every source before calling models, then process each model in
         # a batch-wide phase to avoid needless LM Studio model load/unload cycles.
         for item in items:
+            _check_stop_requested()
             try:
                 with core.connect() as db:
                     db.execute("UPDATE batch_items SET status='preparing' WHERE id=?",(item['id'],))
                 document_id=core.ingest(item['path'])
+                _check_stop_requested()
                 with core.connect() as db:
                     pages=db.execute('SELECT count(*) FROM pages WHERE document_id=?',(document_id,)).fetchone()[0]
                     db.execute("UPDATE batch_items SET status='ocr',document_id=?,pages=? WHERE id=?",(document_id,pages,item['id']))
             except Exception as exc:
+                if isinstance(exc,core.ProcessingStopped):
+                    raise
                 with core.connect() as db:
                     db.execute("UPDATE batch_items SET status='failed',error=? WHERE id=?",(str(exc),item['id']))
 
@@ -662,6 +873,7 @@ def run_batch(batch_id):
 
         # OCR phase: keep the OCR model active across all prepared files.
         for item in ready:
+            _check_stop_requested()
             try:
                 with core.connect() as db:
                     prior=completed_stage_pages(db,item['document_id'],'ocr')
@@ -672,7 +884,16 @@ def run_batch(batch_id):
                 with core.connect() as db:
                     job_id=db.execute("INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit) VALUES(?,?,?,?,?,?,?)",(item['document_id'],'queued',batch['ocr_model'],core.now(),'lmstudio','ocr',batch['stop_on_output_limit'])).lastrowid
                     db.execute('UPDATE batch_items SET ocr_job_id=? WHERE id=?',(job_id,item['id']))
-                core.ocr(job_id)
+                try:
+                    core.ocr(job_id,stop_requested=stop_event.is_set)
+                except TypeError as exc:
+                    if 'stop_requested' not in str(exc):
+                        raise
+                    core.ocr(job_id)
+                if stop_event.is_set():
+                    raise core.ProcessingStopped()
+                if stop_event.is_set():
+                    raise core.ProcessingStopped()
                 with core.connect() as db:
                     result=db.execute('SELECT status,error FROM jobs WHERE id=?',(job_id,)).fetchone()
                     transcribed=db.execute("SELECT count(DISTINCT p.id) FROM pages p JOIN transcriptions t ON t.page_id=p.id AND t.status='complete' WHERE p.document_id=? AND p.ignored=0",(item['document_id'],)).fetchone()[0]
@@ -686,6 +907,8 @@ def run_batch(batch_id):
                 if not transcribed:
                     _append_batch_error(item['id'],'Evidence extraction skipped: no pages were successfully transcribed.')
             except Exception as exc:
+                if isinstance(exc,core.ProcessingStopped):
+                    raise
                 _append_batch_error(item['id'],'OCR: '+str(exc))
 
         with core.connect() as db:
@@ -693,6 +916,7 @@ def run_batch(batch_id):
 
         # Primary extraction phase: process every OCR-ready document in turn.
         for item in usable:
+            _check_stop_requested()
             try:
                 with core.connect() as db:
                     if completed_stage_pages(db,item['document_id'],'evidence'):
@@ -702,14 +926,26 @@ def run_batch(batch_id):
                 with core.connect() as db:
                     job_id=db.execute("INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit) VALUES(?,?,?,?,?,?,?)",(item['document_id'],'queued',batch['evidence_model'],core.now(),'lmstudio','evidence',batch['stop_on_output_limit'])).lastrowid
                     db.execute("UPDATE batch_items SET status='extracting',evidence_job_id=? WHERE id=?",(job_id,item['id']))
-                core.extract(job_id)
+                try:
+                    core.extract(job_id,stop_requested=stop_event.is_set)
+                except TypeError as exc:
+                    if 'stop_requested' not in str(exc):
+                        raise
+                    core.extract(job_id)
+                if stop_event.is_set():
+                    raise core.ProcessingStopped()
+                if stop_event.is_set():
+                    raise core.ProcessingStopped()
                 _batch_extraction_result(job_id,item['id'],'Evidence','candidates')
             except Exception as exc:
+                if isinstance(exc,core.ProcessingStopped):
+                    raise
                 _append_batch_error(item['id'],'Evidence extraction: '+str(exc))
 
         # Optional MedGemma phase: all documents are grouped into one pass too.
         if batch['medgemma_model']:
             for item in usable:
+                _check_stop_requested()
                 try:
                     with core.connect() as db:
                         if completed_stage_pages(db,item['document_id'],'medgemma'):
@@ -719,23 +955,41 @@ def run_batch(batch_id):
                     with core.connect() as db:
                         job_id=db.execute("INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit) VALUES(?,?,?,?,?,?,?)",(item['document_id'],'queued',batch['medgemma_model'],core.now(),'lmstudio','medgemma',batch['stop_on_output_limit'])).lastrowid
                         db.execute("UPDATE batch_items SET status='medgemma',medgemma_job_id=? WHERE id=?",(job_id,item['id']))
-                    core.extract(job_id)
+                    try:
+                        core.extract(job_id,stop_requested=stop_event.is_set)
+                    except TypeError as exc:
+                        if 'stop_requested' not in str(exc):
+                            raise
+                        core.extract(job_id)
+                    if stop_event.is_set():
+                        raise core.ProcessingStopped()
+                    if stop_event.is_set():
+                        raise core.ProcessingStopped()
                     _batch_extraction_result(job_id,item['id'],'MedGemma','medgemma_candidates')
                 except Exception as exc:
+                    if isinstance(exc,core.ProcessingStopped):
+                        raise
                     _append_batch_error(item['id'],'MedGemma extraction: '+str(exc))
 
         with core.connect() as db:
-            db.execute("UPDATE batch_items SET status=CASE WHEN error IS NULL OR error='' THEN 'complete' ELSE 'needs_attention' END WHERE batch_id=? AND status!='failed'",(batch_id,))
-            completed=db.execute("SELECT count(*) FROM batch_items WHERE batch_id=? AND status IN ('complete','needs_attention','failed')",(batch_id,)).fetchone()[0]
+            db.execute("UPDATE batch_items SET status=CASE WHEN error IS NULL OR error='' THEN 'complete' ELSE 'needs_attention' END WHERE batch_id=? AND status NOT IN ('failed','interrupted')",(batch_id,))
+            completed=db.execute("SELECT count(*) FROM batch_items WHERE batch_id=? AND status IN ('complete','needs_attention','failed','interrupted')",(batch_id,)).fetchone()[0]
             failed=db.execute("SELECT count(*) FROM batch_items WHERE batch_id=? AND status IN ('needs_attention','failed')",(batch_id,)).fetchone()[0]
             batch_finish=core.now()
             db.execute('UPDATE batches SET completed=?,status=?,finished_at=?,updated=? WHERE id=?',(completed,'needs_attention' if failed else 'complete',batch_finish,batch_finish,batch_id))
+    except core.ProcessingStopped:
+        with core.connect() as db:
+            batch_finish=core.now()
+            db.execute("UPDATE batch_items SET status='interrupted' WHERE batch_id=? AND status IN ('queued','preparing','ocr','extracting','medgemma')",(batch_id,))
+            completed=db.execute("SELECT count(*) FROM batch_items WHERE batch_id=? AND status IN ('complete','needs_attention','failed','interrupted')",(batch_id,)).fetchone()[0]
+            db.execute("UPDATE batches SET status='interrupted',completed=?,finished_at=?,updated=? WHERE id=?",(completed,batch_finish,batch_finish,batch_id))
     except Exception as exc:
         with core.connect() as db:
             batch_finish=core.now()
             db.execute("UPDATE batches SET status='failed',finished_at=?,updated=? WHERE id=?",(batch_finish,batch_finish,batch_id))
             db.execute("UPDATE batch_items SET status='failed',error=COALESCE(error,?) WHERE batch_id=? AND status IN ('queued','preparing','ocr','extracting','medgemma')",(str(exc),batch_id))
     finally:
+        stop_event.clear()
         lock.release()
 @app.post('/api/extract')
 def extract(data: Extraction):
@@ -759,6 +1013,7 @@ def extract(data: Extraction):
             lock.release()
             raise HTTPException(409,f'Run OCR successfully for all {missing} remaining pages before extracting evidence. Embedded PDF text is not used.')
         jid = db.execute('INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit) VALUES(?,?,?,?,?,?,?)',(data.document_id,'queued',data.model,core.now(),'lmstudio','evidence',int(data.stop_on_output_limit))).lastrowid
+    stop_event.clear()
     threading.Thread(target=start_job,args=(jid,),daemon=True).start()
     return {'job_id':jid}
 
@@ -780,6 +1035,7 @@ def extract_medgemma(data: Extraction):
                 raise HTTPException(409,f'Run OCR successfully for all {missing} remaining pages before MedGemma extraction.')
             jid=db.execute("INSERT INTO jobs(document_id,status,model,created,provider,kind,stop_on_output_limit) VALUES(?,?,?,?,?,?,?)",
                 (data.document_id,'queued',data.model,core.now(),'lmstudio','medgemma',int(data.stop_on_output_limit))).lastrowid
+        stop_event.clear()
         threading.Thread(target=start_job,args=(jid,),daemon=True).start()
         return {'job_id':jid}
     except Exception:
@@ -805,6 +1061,7 @@ def resume(jid: int):
         if missing:
             lock.release()
             raise HTTPException(409,f'Run OCR successfully for {missing} remaining pages before resuming evidence extraction.')
+    stop_event.clear()
     threading.Thread(target=start_job,args=(jid,),daemon=True).start()
     return {'job_id':jid}
 

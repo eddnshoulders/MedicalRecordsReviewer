@@ -48,6 +48,15 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(core.ensure_model_context('medgemma-1.5-4b-it',16384),16384)
         build.assert_not_called()
 
+    @patch('reviewer.core.urllib.request.build_opener')
+    def test_ocr_request_accepts_configured_context(self, build):
+        build.return_value.open.return_value=io.BytesIO(json.dumps({'output':[{'type':'message','content':'text'}],'stats':{}}).encode())
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'page.png';path.write_bytes(b'synthetic-image')
+            core.ocr_call('lighton',path,32768)
+        body=json.loads(build.return_value.open.call_args.args[0].data)
+        self.assertEqual(body['context_length'],32768)
+
     @patch('reviewer.core.list_model_contexts')
     def test_stage_budgets_use_loaded_context_and_output_caps(self, contexts):
         contexts.return_value={

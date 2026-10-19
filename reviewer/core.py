@@ -63,6 +63,9 @@ class OutputLimitError(ValueError):
         self.finish_reason=finish_reason
         self.context_length=context_length
 
+class ProcessingStopped(Exception):
+    """Raised internally when the user requests cooperative cancellation."""
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -146,13 +149,28 @@ def init():
             db.execute('ALTER TABLE jobs ADD COLUMN runtime_seconds REAL NOT NULL DEFAULT 0')
         if 'runtime_started_at' not in job_columns:
             db.execute('ALTER TABLE jobs ADD COLUMN runtime_started_at TEXT')
+        if 'target_page_id' not in job_columns:
+            db.execute('ALTER TABLE jobs ADD COLUMN target_page_id TEXT')
         if 'source_ext' not in {r['name'] for r in db.execute('PRAGMA table_info(documents)')}:
             db.execute("ALTER TABLE documents ADD COLUMN source_ext TEXT NOT NULL DEFAULT '.pdf'")
         if 'ignored' not in {r['name'] for r in db.execute('PRAGMA table_info(pages)')}:
             db.execute('ALTER TABLE pages ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0')
+        page_columns={r['name'] for r in db.execute('PRAGMA table_info(pages)')}
+        for column in ('nuextract_use_image','medgemma_use_image'):
+            if column not in page_columns:
+                db.execute(f'ALTER TABLE pages ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0')
         db.executescript('''
         CREATE TABLE IF NOT EXISTS transcriptions(id INTEGER PRIMARY KEY,page_id TEXT REFERENCES pages(id),job_id INTEGER,model TEXT,text TEXT,status TEXT,error TEXT,image_hash TEXT,created TEXT);
         ''')
+        transcription_columns={r['name'] for r in db.execute('PRAGMA table_info(transcriptions)')}
+        if 'compacted_text' not in transcription_columns:
+            db.execute('ALTER TABLE transcriptions ADD COLUMN compacted_text TEXT')
+        # Populate the shared post-OCR table representation for existing pages.
+        # Keep the original transcription untouched for display, audit, and edits.
+        for row in db.execute("SELECT id,text FROM transcriptions WHERE status='complete' AND text LIKE '%<table%' AND compacted_text IS NULL").fetchall():
+            compacted,changed=readable_extraction_source(row['text'] or '')
+            if changed:
+                db.execute('UPDATE transcriptions SET compacted_text=? WHERE id=?',(compacted,row['id']))
         # Older jobs have no timing data. Their creation time is a safe start
         # estimate; the latest saved page output gives a useful finish estimate.
         db.execute("UPDATE jobs SET started_at=created WHERE started_at IS NULL AND status!='queued'")
@@ -188,8 +206,11 @@ def init():
 
         # Populate progress columns for jobs created before page-level progress
         # was introduced. The output rows are the durable source of truth.
-        for job in db.execute('SELECT id,document_id,kind,completed_pages,last_completed_page FROM jobs').fetchall():
-            total=db.execute('SELECT count(*) FROM pages WHERE document_id=? AND ignored=0',(job['document_id'],)).fetchone()[0]
+        for job in db.execute('SELECT id,document_id,kind,target_page_id FROM jobs').fetchall():
+            if job['target_page_id']:
+                total=db.execute('SELECT count(*) FROM pages WHERE id=? AND ignored=0',(job['target_page_id'],)).fetchone()[0]
+            else:
+                total=db.execute('SELECT count(*) FROM pages WHERE document_id=? AND ignored=0',(job['document_id'],)).fetchone()[0]
             if job['kind']=='ocr':
                 progress=db.execute("""SELECT count(DISTINCT t.page_id),max(p.number)
                     FROM transcriptions t JOIN pages p ON p.id=t.page_id
@@ -198,10 +219,7 @@ def init():
                 progress=db.execute("""SELECT count(DISTINCT r.page_id),max(p.number)
                     FROM runs r JOIN pages p ON p.id=r.page_id
                     WHERE r.job_id=? AND r.status='complete' AND p.ignored=0""",(job['id'],)).fetchone()
-            completed=max(job['completed_pages'] or 0,progress[0] or 0)
-            last_values=[value for value in (job['last_completed_page'],progress[1]) if value is not None]
-            last=max(last_values) if last_values else None
-            db.execute('UPDATE jobs SET total_pages=?,completed_pages=?,last_completed_page=? WHERE id=?',(total,completed,last,job['id']))
+            db.execute('UPDATE jobs SET total_pages=?,completed_pages=?,last_completed_page=? WHERE id=?',(total,progress[0] or 0,progress[1],job['id']))
 
         rebuild_page_search(db)
 
@@ -209,6 +227,9 @@ def init():
         CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY,folder TEXT,status TEXT,ocr_model TEXT,evidence_model TEXT,medgemma_model TEXT,created TEXT,updated TEXT,total INTEGER,completed INTEGER DEFAULT 0,started_at TEXT,finished_at TEXT,stop_on_output_limit INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS batch_items(id INTEGER PRIMARY KEY,batch_id INTEGER REFERENCES batches(id),path TEXT,name TEXT,status TEXT,document_id TEXT,ocr_job_id INTEGER,evidence_job_id INTEGER,medgemma_job_id INTEGER,error TEXT,pages INTEGER DEFAULT 0,transcribed INTEGER DEFAULT 0,candidates INTEGER DEFAULT 0,medgemma_candidates INTEGER DEFAULT 0);
         ''')
+        db.execute("INSERT OR IGNORE INTO semantic_settings(key,value) VALUES('import_top_level_path',?)",(str(Path.home()),))
+        for key,value in (('ocr_context_length',16384),('evidence_context_length',8192),('medgemma_context_length',16384),('embedding_context_length',8192)):
+            db.execute('INSERT OR IGNORE INTO semantic_settings(key,value) VALUES(?,?)',(key,str(value)))
         if 'medgemma_model' not in {r['name'] for r in db.execute('PRAGMA table_info(batches)')}:
             db.execute('ALTER TABLE batches ADD COLUMN medgemma_model TEXT')
         batch_columns={r['name'] for r in db.execute('PRAGMA table_info(batches)')}
@@ -228,6 +249,21 @@ def init():
             db.execute('ALTER TABLE batch_items ADD COLUMN medgemma_job_id INTEGER')
         if 'medgemma_candidates' not in {r['name'] for r in db.execute('PRAGMA table_info(batch_items)')}:
             db.execute('ALTER TABLE batch_items ADD COLUMN medgemma_candidates INTEGER DEFAULT 0')
+
+def get_setting(key, default=None):
+    with connect() as db:
+        row=db.execute('SELECT value FROM semantic_settings WHERE key=?',(key,)).fetchone()
+        return row['value'] if row else default
+
+def set_setting(key, value):
+    with connect() as db:
+        db.execute('INSERT INTO semantic_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,str(value)))
+
+def stage_context_length(stage):
+    defaults={'ocr':16384,'evidence':8192,'medgemma':16384,'embedding':8192}
+    if stage not in defaults:
+        raise ValueError(f'Unknown model stage: {stage}')
+    return int(get_setting(f'{stage}_context_length',defaults[stage]))
 
 def rebuild_page_search(db=None):
     """Keep the FTS index aligned with the latest successful OCR per page."""
@@ -392,6 +428,56 @@ def ingest_image(source, register_only=False):
         db.execute('UPDATE documents SET status=? WHERE id=?',(status,digest))
     return digest
 
+def ensure_page_image(page_id):
+    """Return a prepared page image, rebuilding it from the preserved original if missing."""
+    import pymupdf as fitz
+    with connect() as db:
+        row=db.execute('''SELECT p.document_id,p.number,p.image,d.source_ext
+            FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id=?''',(page_id,)).fetchone()
+    if not row:
+        raise FileNotFoundError('Page not found.')
+    saved=Path(row['image']) if row['image'] else None
+    if saved and saved.is_file():
+        return saved
+
+    document_id=row['document_id']
+    ext=row['source_ext'] if row['source_ext'] in (IMAGE_EXTENSIONS | {'.pdf'}) else '.pdf'
+    root=ROOT.resolve()
+    original=(root/'originals'/(document_id+ext)).resolve()
+    if not original.is_relative_to(root) or not original.is_file():
+        raise FileNotFoundError('The saved page image and preserved original are both missing.')
+    destination=(root/'pages'/document_id/(str(row['number'])+'.png')).resolve()
+    if not destination.is_relative_to(root):
+        raise ValueError('Page image path points outside the dataset.')
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    try:
+        source_bytes=original.read_bytes()
+        if ext=='.pdf':
+            document=fitz.open(stream=source_bytes,filetype='pdf')
+            if document.needs_pass and not document.authenticate(''):
+                document.close()
+                raise ValueError('The preserved PDF is password protected; its page preview cannot be rebuilt without the opening password.')
+            index=row['number']-1
+            if index<0 or index>=document.page_count:
+                document.close()
+                raise ValueError('The saved page number is outside the preserved PDF.')
+            document[index].get_pixmap(dpi=140).save(destination)
+            document.close()
+        else:
+            document=fitz.open(stream=source_bytes,filetype=ext[1:])
+            if document.page_count<1:
+                document.close()
+                raise ValueError('The preserved image contains no readable page.')
+            document[0].get_pixmap(dpi=96).save(destination)
+            document.close()
+    except Exception as exc:
+        if isinstance(exc,ValueError):
+            raise
+        raise ValueError(f'Could not rebuild the missing page image: {exc}') from exc
+    with connect() as db:
+        db.execute('UPDATE pages SET image=? WHERE id=?',(str(destination),page_id))
+    return destination
+
 def lm_headers():
     headers = {'Content-Type':'application/json'}
     token = os.environ.get('LM_API_TOKEN')
@@ -399,7 +485,19 @@ def lm_headers():
         headers['Authorization'] = 'Bearer ' + token
     return headers
 
-def model_call(model, prompt):
+def multimodal_user_content(prompt, image_path=None):
+    if image_path is None:
+        return prompt
+    path=Path(image_path)
+    image=base64.b64encode(path.read_bytes()).decode('ascii')
+    import mimetypes
+    mime=mimetypes.guess_type(path.name)[0] or 'image/png'
+    return [
+        {'type':'text','text':'The attached image is the original document page. Use it alongside the OCR text below to identify evidence, while following the requested event fields and JSON schema.\n\n'+prompt},
+        {'type':'image_url','image_url':{'url':f'data:{mime};base64,{image}'}},
+    ]
+
+def model_call(model, prompt, context_length=None, image_path=None):
     # Fixed loopback endpoint: source records cannot be routed to a remote URL.
     properties = {key: {'type':'string'} for key in ('event_type','treatment','source_quote')}
     properties['source_quote']['maxLength'] = 500
@@ -409,7 +507,7 @@ def model_call(model, prompt):
     is_medgemma='medgemma' in model.casefold()
     output_limit=MEDGEMMA_OUTPUT_TOKEN_LIMIT if is_medgemma else EVIDENCE_OUTPUT_TOKEN_LIMIT
     sampling=MEDGEMMA_SAMPLING if is_medgemma else {'temperature':0}
-    body = json.dumps({'model':model,'messages':[{'role':'user','content':prompt}], 'stream':False,**sampling,'max_tokens':output_limit,'response_format':{'type':'json_schema','json_schema':{'name':'evidence','strict':True,'schema':schema}}}).encode()
+    body = json.dumps({'model':model,'messages':[{'role':'user','content':multimodal_user_content(prompt,image_path)}], 'stream':False,**sampling,'max_tokens':output_limit,'response_format':{'type':'json_schema','json_schema':{'name':'evidence','strict':True,'schema':schema}}}).encode()
     request = urllib.request.Request('http://127.0.0.1:1234/v1/chat/completions', body, lm_headers())
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
@@ -434,6 +532,10 @@ def model_call(model, prompt):
                 context_length=(result.get('model_info') or {}).get('context_length'))
         raise ValueError(f'LM Studio did not finish the extraction (finish_reason={finish or "unknown"}); inspect the request log and retry.')
     return {'content':choice['message']['content'],'input_tokens':(result.get('usage') or {}).get('prompt_tokens'),'output_tokens':(result.get('usage') or {}).get('completion_tokens'),'finish_reason':finish,'context_length':(result.get('model_info') or {}).get('context_length')}
+
+def page_uses_image(kind,page):
+    key='medgemma_use_image' if kind=='medgemma' else 'nuextract_use_image'
+    return bool(page[key])
 
 def list_models():
     return [item['key'] for item in list_model_details() if item.get('key')]
@@ -780,8 +882,9 @@ def get_assessment_criteria(topic):
             FROM assessment_criteria WHERE topic LIKE ? OR title LIKE ? OR body LIKE ? ORDER BY topic,title,id''',(term,term,term)).fetchall()
     return {'topic':topic,'criteria':[dict(row) for row in rows],'configured':bool(rows),'message':'No source-verified assessment criteria are configured locally for this topic. Do not infer or invent regulatory rules; load an authoritative, versioned source before assessment.' if not rows else None}
 
-def ocr_call(model, image_path):
+def ocr_call(model, image_path, context_length=16384):
     image = base64.b64encode(Path(image_path).read_bytes()).decode('ascii')
+    context_length=context_length or 16384
     # LightOnOCR is trained with thinking disabled. Ask LM Studio's native API
     # to disable reasoning explicitly, and accept only its message output.
     payload = {
@@ -790,7 +893,7 @@ def ocr_call(model, image_path):
         'reasoning':'off',
         'temperature':0,
         'max_output_tokens':8192,
-        'context_length':16384,
+        'context_length':context_length,
         'store':False,
         'stream':False,
     }
@@ -809,20 +912,27 @@ def ocr_call(model, image_path):
         output_types=', '.join(item.get('type','unknown') for item in result.get('output',[])) or 'none'
         raise ValueError(f"Suspected Blank Page — LM Studio completed the request but returned no transcription (output types: {output_types}). Review the page image; if it is blank or unusable, mark it Ignore page. Reasoning output is intentionally excluded from OCR text.")
     stats=result.get('stats') or {}
-    return {'content':text,'input_tokens':stats.get('input_tokens'),'output_tokens':stats.get('total_output_tokens'),'finish_reason':'stop','context_length':16384}
+    return {'content':text,'input_tokens':stats.get('input_tokens'),'output_tokens':stats.get('total_output_tokens'),'finish_reason':'stop','context_length':context_length}
 
-def ocr(job_id, call=ocr_call):
+def ocr(job_id, call=ocr_call, stop_requested=None):
     with connect() as db:
         job = db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
-        all_pages=db.execute('SELECT count(*) FROM pages WHERE document_id=?',(job['document_id'],)).fetchone()[0]
-        pages = db.execute('SELECT * FROM pages WHERE document_id=? AND ignored=0 ORDER BY number',(job['document_id'],)).fetchall()
+        scope=' AND id=?' if job['target_page_id'] else ''
+        args=(job['document_id'],job['target_page_id']) if job['target_page_id'] else (job['document_id'],)
+        pages = db.execute('SELECT * FROM pages WHERE document_id=? AND ignored=0'+scope+' ORDER BY number',args).fetchall()
         completed=db.execute("SELECT count(DISTINCT t.page_id) FROM transcriptions t JOIN pages p ON p.id=t.page_id WHERE t.job_id=? AND t.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
         last=db.execute("SELECT max(p.number) FROM transcriptions t JOIN pages p ON p.id=t.page_id WHERE t.job_id=? AND t.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
         started=now()
-        db.execute("UPDATE jobs SET status='running',started_at=coalesce(started_at,?),runtime_started_at=?,finished_at=NULL,error=NULL,context_length=16384,output_token_limit=8192,max_input_tokens=NULL,max_output_tokens=NULL,current_page=NULL,completed_pages=?,total_pages=?,last_completed_page=? WHERE id=?",(started,started,completed,len(pages),last,job_id))
+    context_length=ensure_model_context(job['model'],stage_context_length('ocr')) if call is ocr_call else 16384
+    with connect() as db:
+        db.execute("UPDATE jobs SET status='running',started_at=coalesce(started_at,?),runtime_started_at=?,finished_at=NULL,error=NULL,context_length=?,output_token_limit=8192,max_input_tokens=NULL,max_output_tokens=NULL,current_page=NULL,completed_pages=?,total_pages=?,last_completed_page=? WHERE id=?",(started,started,context_length,completed,len(pages),last,job_id))
     failed=0
     empty_pages=[]
+    stopped=False
     for page in pages:
+        if stop_requested and stop_requested():
+            stopped=True
+            break
         with connect() as db:
             if db.execute("SELECT id FROM transcriptions WHERE job_id=? AND page_id=? AND status='complete'",(job_id,page['id'])).fetchone():
                 continue
@@ -833,7 +943,7 @@ def ocr(job_id, call=ocr_call):
             if not path.is_file():
                 raise ValueError('Page image missing. Prepare pages before OCR.')
             image_hash=hashlib.sha256(path.read_bytes()).hexdigest()
-            response=call(job['model'],path)
+            response=call(job['model'],path,context_length) if call is ocr_call else call(job['model'],path)
             if isinstance(response,dict) and 'content' in response:
                 output=response['content']
                 input_tokens=response.get('input_tokens')
@@ -851,8 +961,9 @@ def ocr(job_id, call=ocr_call):
             if error.startswith('Suspected Blank Page —') and page['number'] not in empty_pages:
                 empty_pages.append(page['number'])
         with connect() as db:
-            db.execute('INSERT INTO transcriptions(page_id,job_id,model,text,status,error,image_hash,created) VALUES(?,?,?,?,?,?,?,?)',
-                       (page['id'],job_id,job['model'],output,status,error,image_hash,now()))
+            compacted_text,has_compacted_tables=readable_extraction_source(output) if status=='complete' else ('',False)
+            db.execute('INSERT INTO transcriptions(page_id,job_id,model,text,status,error,image_hash,created,compacted_text) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (page['id'],job_id,job['model'],output,status,error,image_hash,now(),compacted_text if has_compacted_tables else None))
             if status=='complete':
                 if input_tokens is not None or output_tokens is not None:
                     db.execute('UPDATE jobs SET max_input_tokens=max(coalesce(max_input_tokens,0),?),max_output_tokens=max(coalesce(max_output_tokens,0),?) WHERE id=?',(input_tokens or 0,output_tokens or 0,job_id))
@@ -870,8 +981,9 @@ def ocr(job_id, call=ocr_call):
         if empty_pages:
             issue_text.append('Suspected Blank Page — review page(s) '+', '.join(map(str,empty_pages))+'. OCR returned no text; inspect each image and mark blank or unusable pages Ignore page.')
         issue_text.append(f'{len(pages)} pages eligible. Latest successful OCR is used automatically for evidence extraction.')
-        status='needs_attention' if failed or (not pages and eligible>0) else 'complete'
-        finish_job(db,job_id,status,' '.join(issue_text) if status!='complete' else None)
+        status='interrupted' if stopped else ('needs_attention' if failed or (not pages and eligible>0) else 'complete')
+        error='Stopped by user between pages. Completed pages are retained; retry to continue.' if stopped else (' '.join(issue_text) if status!='complete' else None)
+        finish_job(db,job_id,status,error)
 
 def delete_document(document_id):
     """Remove only application-owned artifacts; a failed cleanup can be retried."""
@@ -1068,22 +1180,22 @@ def deduplicate_events(events):
             unique.append(event)
     return unique
 
-def extract(job_id, call=model_call, prompt_template=None):
+def extract(job_id, call=model_call, prompt_template=None, stop_requested=None):
     with connect() as db:
         job = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
-    if job and job['kind']=='medgemma' and call is model_call:
-        context_length=ensure_model_context(job['model'],16384)
+    if job and call is model_call:
+        context_length=ensure_model_context(job['model'],stage_context_length(job['kind'] or 'evidence'))
     else:
         context_length=model_context_length(job['model']) if job else None
     context_checked=context_length is not None
     with connect() as db:
         job = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
         prompt_template = prompt_template or (MEDGEMMA_PROMPT if job['kind']=='medgemma' else PROMPT)
-        pages = db.execute("""SELECT p.*,t.id AS transcription_id,t.text AS working_text
+        pages = db.execute("""SELECT p.*,t.id AS transcription_id,t.text AS working_text,t.compacted_text AS compacted_text
             FROM pages p LEFT JOIN transcriptions t ON t.id=(
                 SELECT id FROM transcriptions x WHERE x.page_id=p.id AND x.status='complete' ORDER BY id DESC LIMIT 1)
-            WHERE p.document_id=? AND p.ignored=0 ORDER BY p.number""", (job['document_id'],)).fetchall()
-        all_pages=db.execute('SELECT count(*) FROM pages WHERE document_id=?',(job['document_id'],)).fetchone()[0]
+            WHERE p.document_id=? AND p.ignored=0 AND (? IS NULL OR p.id=?) ORDER BY p.number""",(job['document_id'],job['target_page_id'],job['target_page_id'])).fetchall()
+        all_pages=len(pages)
         completed=db.execute("SELECT count(DISTINCT r.page_id) FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=? AND r.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
         last=db.execute("SELECT max(p.number) FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=? AND r.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
         output_limit=MEDGEMMA_OUTPUT_TOKEN_LIMIT if job['kind']=='medgemma' else EVIDENCE_OUTPUT_TOKEN_LIMIT
@@ -1099,7 +1211,11 @@ def extract(job_id, call=model_call, prompt_template=None):
     failures = 0
     stopped_for_token_limit_page=None
     continued_after_token_limit_pages=[]
+    stopped=False
     for page in pages:
+        if stop_requested and stop_requested():
+            stopped=True
+            break
         with connect() as db:
             db.execute('UPDATE jobs SET current_page=? WHERE id=?',(page['number'],job_id))
         if page['working_text'] is None:
@@ -1115,20 +1231,29 @@ def extract(job_id, call=model_call, prompt_template=None):
             prior = db.execute("SELECT id FROM runs WHERE job_id=? AND page_id=? AND status='complete'", (job_id,page['id'])).fetchone()
         if prior:
             continue
-        source,table_rendered=readable_extraction_source(page['working_text'])
+        if page['compacted_text'] is not None:
+            source,table_rendered=page['compacted_text'],True
+        else:
+            # Also covers older test fixtures and OCR rows written before this
+            # post-processing field existed.
+            source,table_rendered=readable_extraction_source(page['working_text'])
         chunks=split_extraction_source(source)
         prompts=[]
         for index,chunk in enumerate(chunks,1):
             segment_note=(f'This is segment {index} of {len(chunks)} from one document page. Extract only evidence supported by this segment. ' if len(chunks)>1 else '')
             prompts.append(prompt_template+segment_note+chunk)
         prompt='\n\n'.join(prompts)
+        image_path=ensure_page_image(page['id']) if page_uses_image(job['kind'] or 'evidence',page) else None
         output=''
         input_tokens=output_tokens=finish_reason=None
         peak_input_tokens=peak_output_tokens=0
         extracted_events=[]
         try:
             for index,(chunk,chunk_prompt) in enumerate(zip(chunks,prompts),1):
-                response=call(job['model'],chunk_prompt)
+                if stop_requested and stop_requested():
+                    stopped=True
+                    raise ProcessingStopped('Stopped by user before all text segments on this page were processed. This page will be retried.')
+                response=call(job['model'],chunk_prompt,context_length,image_path=image_path) if call is model_call else call(job['model'],chunk_prompt)
                 if isinstance(response,dict) and 'content' in response:
                     chunk_output=response['content']
                     chunk_input=response.get('input_tokens')
@@ -1193,6 +1318,9 @@ def extract(job_id, call=model_call, prompt_template=None):
                 done=db.execute("SELECT count(DISTINCT r.page_id) FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=? AND r.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
                 last=db.execute("SELECT max(p.number) FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=? AND r.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
                 db.execute('UPDATE jobs SET completed_pages=?,last_completed_page=? WHERE id=?',(done,last,job_id))
+            if isinstance(exc,ProcessingStopped):
+                stopped=True
+                break
             if isinstance(exc,OutputLimitError):
                 if job['stop_on_output_limit']:
                     stopped_for_token_limit_page=page['number']
@@ -1201,13 +1329,16 @@ def extract(job_id, call=model_call, prompt_template=None):
     with connect() as db:
         quote_mismatches=db.execute('SELECT count(*) FROM evidence WHERE quote_match=0 AND run_id IN (SELECT id FROM runs WHERE job_id=?)',(job_id,)).fetchone()[0]
         eligible=db.execute('SELECT count(*) FROM pages WHERE document_id=? AND ignored=0',(job['document_id'],)).fetchone()[0]
-        status='needs_attention' if failures or (not pages and eligible>0) else 'complete'
+        status='interrupted' if stopped else ('needs_attention' if failures or (not pages and eligible>0) else 'complete')
         error=f'{failures} failed pages; {quote_mismatches} quotation mismatches flagged for review; {len(pages)} pages eligible'
+        if stopped:
+            completed=db.execute("SELECT count(DISTINCT r.page_id) FROM runs r JOIN pages p ON p.id=r.page_id WHERE r.job_id=? AND r.status='complete' AND p.ignored=0",(job_id,)).fetchone()[0]
+            error=f'Stopped by user. {completed}/{len(pages)} pages completed; retry to continue.'
         if stopped_for_token_limit_page is not None:
             error+=f' Stopped after page {stopped_for_token_limit_page} because LM Studio returned finish_reason=length; later pages were not processed.'
         if continued_after_token_limit_pages:
             error+=f' Continued after finish_reason=length on page(s) {", ".join(map(str,continued_after_token_limit_pages))} as configured.'
-        finish_job(db,job_id,status,error)
+        finish_job(db,job_id,status,error if status!='complete' or quote_mismatches else None)
 
 def clear_stage_data(document_id, stage):
     """Remove one stage's outputs for a document, invalidating dependent outputs as needed."""
@@ -1250,3 +1381,46 @@ def clear_stage_data(document_id, stage):
         else:
             db.execute('UPDATE batch_items SET medgemma_job_id=NULL,medgemma_candidates=0 WHERE document_id=?',(document_id,))
         return {'stage':stage,'cleared':[stage],'dependent_data_cleared':False}
+
+def clear_page_stage_data(page_id, stage):
+    """Remove one processing stage's outputs for one page only."""
+    if stage not in ('ocr','nuextract','medgemma'):
+        raise ValueError('Unknown processing stage.')
+    with connect() as db:
+        page=db.execute('SELECT id,document_id FROM pages WHERE id=?',(page_id,)).fetchone()
+        if not page:
+            raise ValueError('Page does not exist.')
+        if stage=='ocr':
+            run_ids="SELECT r.id FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.page_id=? AND (j.kind IN ('evidence','medgemma') OR j.kind IS NULL)"
+            evidence_ids='SELECT id FROM evidence WHERE run_id IN ('+run_ids+')'
+            db.execute("""UPDATE jobs SET status='interrupted',finished_at=?,runtime_started_at=NULL,
+                error='Page data was deleted; run the stage again to restore it.'
+                WHERE document_id=? AND kind='ocr' AND (target_page_id=? OR id IN (SELECT job_id FROM transcriptions WHERE page_id=?))""",
+                (now(),page['document_id'],page_id,page_id))
+            db.execute("""UPDATE jobs SET status='interrupted',finished_at=?,runtime_started_at=NULL,
+                error='Page data was deleted; run the stage again to restore it.'
+                WHERE document_id=? AND kind IN ('evidence','medgemma') AND (target_page_id=? OR id IN (SELECT job_id FROM runs WHERE page_id=?) OR id IN (SELECT job_id FROM failed_attempts WHERE page_id=?))""",
+                (now(),page['document_id'],page_id,page_id,page_id))
+            db.execute('DELETE FROM decisions WHERE evidence_id IN ('+evidence_ids+')',(page_id,))
+            db.execute('DELETE FROM evidence WHERE run_id IN ('+run_ids+')',(page_id,))
+            db.execute('DELETE FROM runs WHERE id IN ('+run_ids+')',(page_id,))
+            db.execute('DELETE FROM transcriptions WHERE page_id=?',(page_id,))
+            db.execute('DELETE FROM failed_attempts WHERE page_id=?',(page_id,))
+            db.execute('DELETE FROM page_embeddings WHERE page_id=?',(page_id,))
+            db.execute('DELETE FROM semantic_page_index WHERE page_id=?',(page_id,))
+            db.execute('DELETE FROM page_search WHERE page_id=?',(page_id,))
+            rebuild_page_search(db)
+            return {'stage':stage,'page_id':page_id,'cleared':['OCR','NuExtract','MedGemma','semantic index'],'dependent_data_cleared':True}
+        kind='evidence' if stage=='nuextract' else 'medgemma'
+        run_ids='SELECT id FROM runs WHERE page_id=? AND job_id IN (SELECT id FROM jobs WHERE kind=? OR (kind IS NULL AND ?=\'evidence\'))'
+        evidence_ids='SELECT id FROM evidence WHERE run_id IN ('+run_ids+')'
+        db.execute("""UPDATE jobs SET status='interrupted',finished_at=?,runtime_started_at=NULL,
+            error='Page data was deleted; run the stage again to restore it.' WHERE document_id=?
+            AND (kind=? OR (kind IS NULL AND ?='evidence')) AND
+            (target_page_id=? OR id IN (SELECT job_id FROM runs WHERE page_id=?) OR id IN (SELECT job_id FROM failed_attempts WHERE page_id=?))""",
+            (now(),page['document_id'],kind,kind,page_id,page_id,page_id))
+        db.execute('DELETE FROM decisions WHERE evidence_id IN ('+evidence_ids+')',(page_id,kind,kind))
+        db.execute('DELETE FROM evidence WHERE run_id IN ('+run_ids+')',(page_id,kind,kind))
+        db.execute('DELETE FROM runs WHERE id IN ('+run_ids+')',(page_id,kind,kind))
+        db.execute('DELETE FROM failed_attempts WHERE page_id=? AND job_id IN (SELECT id FROM jobs WHERE kind=? OR (kind IS NULL AND ?=\'evidence\'))',(page_id,kind,kind))
+        return {'stage':stage,'page_id':page_id,'cleared':[stage],'dependent_data_cleared':False}

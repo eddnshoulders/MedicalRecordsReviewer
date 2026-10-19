@@ -41,6 +41,57 @@ class BatchTests(unittest.TestCase):
             self.assertIn('Delete OCR data',error.exception.detail)
             app.ensure_stage_empty(db,document_id,'evidence')
 
+    def test_stop_endpoint_sets_cooperative_stop_flag(self):
+        from fastapi import HTTPException
+        source=Path(self.temp.name)/'stop.pdf'
+        doc=fitz.open();doc.new_page();doc.save(source);doc.close()
+        document_id=core.ingest(source)
+        with core.connect() as db:
+            db.execute("INSERT INTO jobs(document_id,status,model,created,provider,kind) VALUES(?,'running','mock',?,'lmstudio','ocr')",(document_id,core.now()))
+        app.stop_event.clear()
+        try:
+            response=app.stop_current_task()
+            self.assertTrue(response['stop_requested'])
+            self.assertTrue(app.stop_event.is_set())
+        finally:
+            app.stop_event.clear()
+
+    def test_import_endpoint_prepares_pages_even_when_ocr_is_not_requested(self):
+        source=Path(self.temp.name)/'imported.pdf'
+        doc=fitz.open();doc.new_page();doc.save(source);doc.close()
+        result=app.import_pdf(app.Import(path=str(source),register_only=True))
+        with core.connect() as db:
+            rows=db.execute('SELECT status,image FROM pages WHERE document_id=?',(result['id'],)).fetchall()
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['status'],'needs_ocr')
+        self.assertTrue(Path(rows[0]['image']).is_file())
+
+    def test_import_root_path_is_persisted_in_sqlite(self):
+        selected=Path(self.temp.name).resolve()
+        result=app.save_import_root(app.ImportRoot(path=str(selected)))
+        self.assertEqual(result,{'path':str(selected)})
+        self.assertEqual(app.import_root_setting(),{'path':str(selected)})
+
+    def test_missing_page_preview_is_rebuilt_without_clearing_processing_data(self):
+        source=Path(self.temp.name)/'preview.pdf'
+        doc=fitz.open();page=doc.new_page();page.insert_text((72,72),'Synthetic preview page');doc.save(source);doc.close()
+        document_id=core.ingest(source)
+        with core.connect() as db:
+            page=db.execute('SELECT id,image FROM pages WHERE document_id=?',(document_id,)).fetchone()
+            ocr_id=db.execute("INSERT INTO transcriptions(page_id,model,text,status,created) VALUES(?,'mock-ocr','preserved text','complete',?)",(page['id'],core.now())).lastrowid
+            job_id=db.execute("INSERT INTO jobs(document_id,status,model,created,provider,kind) VALUES(?,'complete','mock-extractor',?,'lmstudio','evidence')",(document_id,core.now())).lastrowid
+            run_id=db.execute("INSERT INTO runs(job_id,page_id,model,output,status,created,transcription_id) VALUES(?,?,?,'{}','complete',?,?)",(job_id,page['id'],'mock-extractor',core.now(),ocr_id)).lastrowid
+            db.execute("INSERT INTO evidence(run_id,page_id,payload,quote,status) VALUES(?,?,'{}','preserved quote','confirmed')",(run_id,page['id']))
+        Path(page['image']).unlink()
+        preview=app.image(page['id'])
+        rebuilt=Path(preview.path)
+        self.assertTrue(rebuilt.is_file())
+        self.assertEqual(rebuilt.read_bytes()[:8],b'\x89PNG\r\n\x1a\n')
+        with core.connect() as db:
+            self.assertEqual(db.execute('SELECT text FROM transcriptions WHERE id=?',(ocr_id,)).fetchone()['text'],'preserved text')
+            self.assertEqual(db.execute('SELECT count(*) FROM evidence WHERE run_id=?',(run_id,)).fetchone()[0],1)
+            self.assertEqual(Path(db.execute('SELECT image FROM pages WHERE id=?',(page['id'],)).fetchone()['image']),rebuilt)
+
     def test_main_stage_button_resumes_incomplete_job(self):
         from unittest.mock import patch
         source=Path(self.temp.name)/'resume.pdf'
