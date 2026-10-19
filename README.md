@@ -1,78 +1,72 @@
-# Medical Records Reviewer — first working slice
+# Medical Records Reviewer
 
-Local PDF ingestion, OCR-first page images, SQLite FTS5 and semantic search over OCR, LM Studio evidence extraction, quotation validation, review decisions and resumable extraction jobs.
+A local-first tool for preparing medical-record PDFs and images, running OCR and candidate evidence extraction through LM Studio, reviewing page-level results, and searching the resulting dataset. The app serves its UI on `http://127.0.0.1:8765` and uses a local SQLite database under `data/` by default.
 
-## Run
+## Start the reviewer
+
+From PowerShell in this folder:
 
 ```powershell
-python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\start.ps1
 ```
 
-Open http://127.0.0.1:8765. Enter a full local PDF path. Password-protected PDFs accept an opening password which is not saved. Importing the same file resumes failed page extraction and otherwise deduplicates by SHA-256.
+`start.ps1` reads `LM_API_TOKEN` from the current process or saved Windows user environment, and prompts for it with hidden input if LM Studio authentication is enabled and no token is available. The token is passed only to the local LM Studio server at `http://127.0.0.1:1234`. Open `http://127.0.0.1:8765` in a browser. Stop the server with Ctrl+C in its PowerShell window.
 
-For model extraction, start the LM Studio local server on port 1234, load a downloaded text model with at least 8192 context tokens, and click Find models or enter its exact model identifier. No models are downloaded by this app. Only the loopback LM Studio endpoint at http://127.0.0.1:1234 is used; HTTP proxies are disabled. Other model servers are not wired up yet.
+The app binds to loopback only. It does not send records to a cloud service. The database, imported originals, page images and OCR are stored locally under `data/` (or the directory selected by `REVIEWER_DATA`). These files can contain sensitive information and are not encrypted by the app; use disk encryption and suitable filesystem permissions.
 
-OCR versions are stored separately from existing PDF text. The latest successful OCR transcription is automatically used for search and evidence extraction; evidence runs retain their OCR version ID. The SQLite FTS5 index is rebuilt from the latest successful OCR when the app starts, so old or failed OCR versions do not remain searchable. Embedded PDF text is preserved only as an unverified comparison reference.
+## Import files
 
-The original is copied byte-for-byte to `data/originals`; page images and the SQLite database remain in `data`. This contains sensitive information and is not encrypted by the app. Use OS disk encryption and appropriate filesystem access controls. Bind only to loopback. No telemetry, external scripts, fonts or cloud APIs are used.
+The **Files** page has a saved top-level import folder. Choose it with **Choose top-level folder…** or enter an absolute path; the path is stored in SQLite and restored on startup. **Import File** opens a file picker in that folder. If a PDF requires a password, the app prompts for it and does not save it. **Import Folder** opens a folder picker and imports supported PDFs and images from that folder; **Include subfolders** controls recursion.
 
-## Search
+Importing prepares and caches page images; it does not start OCR or evidence extraction. Supported image types are PNG, JPEG, TIFF and BMP. The original file bytes are preserved in the local dataset. Duplicate imports are identified by content hash.
 
-Search offers keyword, semantic and hybrid modes. Keyword search uses SQLite FTS5 over the latest successful OCR. Semantic search uses a local embedding model through LM Studio's `/v1/embeddings` endpoint; choose a downloaded embedding model, then click **Build / update semantic index**. OCR is split into overlapping chunks, and each vector is tied to its source page and OCR version. Re-OCRed pages are excluded from semantic results until re-indexed. Hybrid search combines lexical and semantic ranks. All modes support document, evidence review-status and extractor filters and open results at the source page. Embedding requests stay on the fixed loopback LM Studio endpoint; no remote service or embedding package is used.
+## Settings and models
 
-## Local reasoning-model tools
+Expand **Settings** on the Files page to choose the available LM Studio models for OCR, NuExtract, MedGemma and embeddings. Context lengths can be set beside each model and are saved in SQLite. The selected context is used when the workflow loads a model. The setting to stop a stage when a page reaches the model output-token limit applies to manual and batch processing.
 
-The app exposes read-only JSON tools under `/api/tools/` for a local reasoning model or a local agent client to call. The model does not query SQLite directly: the app retrieves bounded results and provenance for each request. `POST /api/tools/search_evidence` accepts `{"query":"...","filters":{"document_id":"...","evidence_status":"confirmed","source_stage":"evidence"},"mode":"hybrid","limit":20}`; `filters` is optional and may contain `document_id`, `evidence_status` and `source_stage`. Semantic and hybrid modes require a built semantic index. `GET /api/tools/document_pages/{document_id}` returns the mapping from one-based source page numbers to stable page IDs. `POST /api/tools/get_source` accepts a document ID and one-based page numbers and returns the latest successful OCR text, OCR model/version, page ID, and whether the source page image is available. `POST /api/tools/get_timeline` returns extracted candidate events sorted chronologically, retaining their dates as written, source quotes, review status, model and page provenance; uncertain and non-ISO dates remain unnormalized. `POST /api/tools/get_assessment_criteria` searches locally configured criteria by topic and includes source/version metadata. Since no verified regulatory rules are configured yet, it explicitly returns an empty result; it never fetches or invents rules. These routes are intended for loopback use alongside LM Studio and do not send records to a cloud service. The model should cite returned document/page references and treat extracted events as candidates, not established facts.
+Default model identifiers are `lightonocr-3-4b`, `nuextract3` and `medgemma-1.5-4b-it`; the corresponding models must be installed in LM Studio. Model availability is checked before processing. This app does not download models.
 
-For OCR, the app requests a 16,384-token context with an 8,192-token output cap. NuExtract and MedGemma requests have a 4,096-token output cap; their input allocation is the loaded LM Studio context length minus that cap. The interface shows each stage's per-request allocation and each job's highest observed input/output token counts so far. Job peaks reset when that stage starts or is retried. LM Studio must expose the loaded model context in its local `/api/v1/models` response for the exact allocation to be shown.
+## Page workflow
 
-## Review workflow
+Select one or more files in the dataset table, then run OCR, NuExtract or MedGemma across the selection. Each stage skips completed pages and can resume incomplete or interrupted work. A completed stage must be explicitly cleared before it can be run again, which protects existing output from accidental replacement. **Stop all** requests a stop after the current LM Studio request; completed page results are retained.
 
-### Dataset management and manual stages
+Open a file by clicking its name to inspect its pages. Page buttons show the latest stage outcome; filters can hide selected states. The page view includes page-level run and delete controls and colour-coded OCR, NuExtract and MedGemma status. Page actions refresh the file’s progress values. Processing messages and issues are available in an expandable, vertically resizable section.
 
-Importing a file or folder automatically prepares and caches its page images. The automatic-processing checkbox additionally runs OCR and evidence extraction; when unchecked, the file is prepared for later manual stages. In **Dataset and workflow**, each document has controls to run OCR, start evidence runs, and review candidates. OCR must successfully transcribe every page before evidence extraction; it is the default source for search and evidence. For encrypted single files, enter the opening password in the masked password field during import. Folder imports report files that could not be prepared and continue with the rest.
+OCR is run for every included page. After OCR, HTML tables are converted to a compact readable representation; this derived text is shown alongside the OCR and supplied to both NuExtract and MedGemma. The original OCR transcription remains available and editable as a new version. The latest successful OCR is used for search and extraction. A page’s **NuExtract image** or **MedGemma image** control adds that page image to its next run alongside OCR text; it does not replace or clear the document’s existing results. Use **Ignore page** for a blank or unusable page. Ignoring a page removes its saved processing and review data; including it again allows it to be processed.
 
-**Batch folder run** opens a local Windows folder picker and processes supported files without per-file prompts. It accepts PDFs and PNG, JPEG, TIFF or BMP images; each image becomes a one-page document while the original bytes are preserved. Include subfolders is optional. It prepares every file first, then runs OCR across the whole batch, then primary evidence extraction across all OCR-ready files, followed by the optional MedGemma pass across those files. Grouping work by model avoids repeatedly switching models for each file. The report records batch start, finish and elapsed time for benchmarking. Failures are shown per file and do not stop later files; encrypted PDFs without a supplied password are reported as errors. Batch progress and the latest report remain available after a browser refresh. Start LM Studio's local server and enter the model identifiers first. When the models do not all fit in memory, LM Studio's Just in Time Model Loading and auto-unload settings can switch models between these batch-wide phases.
+Candidates from NuExtract and MedGemma are stored with page and model provenance for review. Quotation mismatches are flagged rather than silently discarded. A completed job means requests completed; it does not guarantee OCR accuracy or that every relevant event was extracted.
 
-MedGemma is an optional second extraction pass. Enter its LM Studio model ID in the separate MedGemma field for a folder batch, or use **Run MedGemma as additional pass** on the selected document. It runs on OCR text through the text extraction API; it does not receive page images or an OCR reasoning setting. Keep LightOnOCR selected in the OCR model field. A MedGemma text model cannot be submitted as the OCR model. MedGemma creates separate evidence candidates with its model and run provenance. Candidates are intentionally not de-duplicated across extractors; possible replications appear as separate cards for review.
+## Search and semantic indexing
 
-**Delete from dataset** asks for confirmation and removes the application-owned PDF copy, page images, text, FTS entries, evidence, review decisions, jobs, runs, and failed-attempt history. The external source file is not deleted. Other documents are unaffected. Deletion is blocked while processing is active. If filesystem removal fails (for example a file is locked), database records remain so deletion can be retried; some artifacts may already have been removed. This is logical deletion, not forensic secure erasure of SQLite free pages or backups.
+The **Search** page provides keyword, semantic and hybrid search. Keyword search uses SQLite FTS5 over the latest successful OCR. Semantic search uses a locally available LM Studio embedding model; use **Build / update semantic index** after selecting the model. OCR text is split into overlapping chunks, with each vector tied to its source page and OCR version. Re-OCRed pages need re-indexing before their new text appears in semantic results. Search results retain page provenance and can be opened for review.
 
-If LM Studio has API authentication enabled, `start.ps1` first checks the current process environment, then the saved Windows user environment variable `LM_API_TOKEN`, and finally prompts with hidden input if neither is set. This also works when the PowerShell window predates setting the user variable. The token is held in the reviewer process environment and sent only to the fixed local LM Studio endpoint. Load the desired model in LM Studio before extraction. Old Ollama jobs cannot be resumed through LM Studio; start a new job, preserving earlier evidence.
+## Logs and job progress
 
-1. Import a PDF and prepare its pages, which creates source images and preserves any embedded PDF text for comparison.
-2. Run OCR on every page using an installed local OCR model. The latest successful OCR transcription is automatically indexed and used as evidence source text.
-3. Run candidate extraction using an installed local LM Studio model.
-4. Select a page, compare its image and OCR transcription with candidate quotations, then save review decisions.
-5. Retry interrupted/failed jobs; completed pages are skipped. A new extraction job retains earlier results as separate evidence runs.
+The **Log** page contains application messages, workflow jobs and folder activity. The workflow and activity panels can be expanded and resized vertically. Each file’s main-table stage indicators include completion and runtime. The app refreshes detailed dataset and page views while jobs are active and checks job state less often while idle.
 
-Candidate quotations are compared character-for-character with the latest successful OCR text. A mismatch is kept with the candidate and flagged for checking against the source image; it no longer discards the page's other candidates. Exact OCR matches are marked in the review card. Model dates/descriptions remain unverified candidates. A completed OCR job means transcription requests completed, not that their contents are accurate. A completed evidence job does not prove all consequential evidence was found. Very long pages are explicitly failed rather than silently truncated.
+## Reasoning-model tools
 
-## Current limits
+Read-only JSON endpoints under `/api/tools/` let a local reasoning model or local agent retrieve bounded evidence and source provenance without querying SQLite directly:
 
-This milestone supports individual PDFs, OCR-first text, a fixed LM Studio adapter, local semantic indexing, and page-level review. Directory ingestion, Lemonade adapter, cross-page reconciliation, chronology, exports, bounding-box highlights, model version fingerprints, and extraction-version migrations remain future work. The worker is single-process and handles one processing task at a time; do not run multiple server workers. Import is synchronous, extraction runs in a background thread. Failed model attempts are retained in an append-only failure history; retries update the current run status while successful runs and review history are preserved.
+- `POST /api/tools/search_evidence` searches OCR and evidence with optional filters.
+- `GET /api/tools/document_pages/{document_id}` maps source page numbers to stable page IDs.
+- `POST /api/tools/get_source` returns latest OCR text and page provenance for requested pages.
+- `POST /api/tools/get_timeline` returns candidate events in chronological order with their source references.
+- `POST /api/tools/get_assessment_criteria` searches locally configured criteria. No regulatory criteria are preloaded; the endpoint does not fetch or invent rules.
+
+These endpoints are intended for local use with the reviewer. A reasoning model should cite the returned document/page references and treat extracted events as candidates, not established facts.
+
+## Data management
+
+**Delete File and Data** removes the application-owned original copy and associated page images, OCR, search entries, evidence, reviews, jobs and runs after confirmation. It does not delete the external source file. Deleting a stage removes that stage’s results for the selected file or page. Deletion is not forensic secure erasure of SQLite free pages, filesystem snapshots or backups.
 
 ## Tests
+
+Run the test suite from PowerShell:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests create synthetic PDFs only and use mock models. They verify source preservation, deduplication, scan flags, lexical and semantic search, quote-mismatch warnings, independent MedGemma candidates and resumability. Actual MedGemma and embedding quality requires separately installed models and local benchmarks.
-
-
-
-
-## OCR with LightOnOCR in LM Studio
-
-1. Restart the reviewer after updating and refresh the browser.
-2. Prepare the document's pages. Existing page images can be reused.
-3. Load `lightonocr-3-4b` in LM Studio, with its vision projector available. Use enough context for the image and up to 8192 output tokens (start with 16384 context).
-4. Click **Find OCR models**, or enter the exact model identifier in the separate OCR field.
-5. Click **Run OCR on all pages** for the document. This reads image pixels rather than the PDF text layer. OCR jobs run sequentially, show progress and can retry failed pages without repeating completed pages.
-6. Open a page in Review and click **Refresh OCR results**. Compare the original image, existing PDF text and OCR versions. The newest successful OCR version is used automatically.
-7. After OCR succeeds on every page, start evidence extraction with the separate evidence model. No per-page text selection is needed.
-
-Each fresh OCR job creates new versions without deleting prior output; the latest successful version becomes the automatic working source. Empty or truncated responses are failures. OCR sends the page image alone, explicitly disables reasoning through LM Studio’s native chat API, and stores only message output as Markdown. Reasoning output is excluded from transcription. It cannot guarantee handwriting accuracy. Images currently use the 140-DPI rendering from page preparation. Automatic discrepancy detection, higher-resolution rerender controls and region crops are future work.
+Tests use synthetic documents and mock model responses; actual extraction and embedding quality must be assessed with locally installed models.
