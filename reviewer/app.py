@@ -652,13 +652,24 @@ def import_folder(data: BatchRequest):
     finally:
         lock.release()
 
+# The job log only needs recent history (plus every job for the open file);
+# older jobs remain in the database.
+STATE_JOB_LIMIT=200
+
+@app.get('/api/version')
+def version():
+    """Cheap change counter; the UI refetches only when this value moves."""
+    return {'version':core.ui_version()}
+
 @app.get('/api/state')
-def state():
+def state(document_id: str | None = None):
     with core.connect() as db:
         jobs=db.execute('''SELECT j.*,
             CASE WHEN j.kind='ocr' THEN (SELECT count(*) FROM transcriptions t WHERE t.job_id=j.id AND t.status='failed')
                  ELSE (SELECT count(*) FROM runs r WHERE r.job_id=j.id AND r.status='failed') END AS retryable
-            FROM jobs j ORDER BY j.id DESC''').fetchall()
+            FROM jobs j WHERE j.status IN ('queued','running') OR j.document_id=?
+                OR j.id IN (SELECT id FROM jobs ORDER BY id DESC LIMIT ?)
+            ORDER BY j.id DESC''',(document_id,STATE_JOB_LIMIT)).fetchall()
         return {'documents':[dict(r) for r in db.execute('SELECT * FROM documents')], 'jobs':[dict(r) for r in jobs]}
 
 @app.get('/api/models')
@@ -752,7 +763,8 @@ def semantic_index_job(job_id: int):
 @app.get('/api/pages/{document_id}')
 def pages(document_id: str):
     with core.connect() as db:
-        rows=db.execute('''SELECT p.*,t.id AS transcription_id,t.model AS ocr_model,t.text AS ocr_text,t.created AS transcribed_at,
+        rows=db.execute('''SELECT p.id,p.document_id,p.number,p.image,p.status,p.error,p.engine,p.ignored,p.nuextract_use_image,p.medgemma_use_image,
+            t.id AS transcription_id,t.model AS ocr_model,(t.id IS NOT NULL) AS has_ocr,t.created AS transcribed_at,
             (SELECT f.error FROM transcriptions f WHERE f.page_id=p.id AND f.status='failed' ORDER BY f.id DESC LIMIT 1) AS ocr_error,
             CASE WHEN p.ignored=1 THEN 'ignored'
                  WHEN t.id IS NOT NULL THEN 'complete'
@@ -777,6 +789,14 @@ def pages(document_id: str):
             FROM pages p LEFT JOIN transcriptions t ON t.id=(SELECT x.id FROM transcriptions x WHERE x.page_id=p.id AND x.status='complete' ORDER BY x.id DESC LIMIT 1)
                 WHERE p.document_id=? ORDER BY p.number''',(document_id,)).fetchall()
         return [dict(row) for row in rows]
+
+@app.get('/api/pages/{page_id}/native-text')
+def page_native_text(page_id: str):
+    with core.connect() as db:
+        row=db.execute('SELECT text,error FROM pages WHERE id=?',(page_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,'Page not found.')
+    return {'page_id':page_id,'text':row['text'],'error':row['error']}
 
 @app.get('/api/image/{page_id}')
 def image(page_id: str):
@@ -1068,7 +1088,7 @@ def resume(jid: int):
 @app.get('/api/runs/{document_id}')
 def runs(document_id: str):
     with core.connect() as db:
-        return [dict(r) for r in db.execute('SELECT runs.id,runs.page_id,runs.status,runs.error,runs.output,runs.input_tokens,runs.output_tokens,runs.finish_reason,runs.model,j.kind FROM runs JOIN pages ON pages.id=runs.page_id JOIN jobs j ON j.id=runs.job_id WHERE pages.document_id=? AND pages.ignored=0',(document_id,))]
+        return [dict(r) for r in db.execute('SELECT runs.id,runs.page_id,runs.status,runs.error,CASE WHEN runs.status=\'failed\' THEN runs.output END AS output,runs.input_tokens,runs.output_tokens,runs.finish_reason,runs.model,j.kind FROM runs JOIN pages ON pages.id=runs.page_id JOIN jobs j ON j.id=runs.job_id WHERE pages.document_id=? AND pages.ignored=0',(document_id,))]
 
 @app.get('/api/search')
 def search(q: str, document_id: str | None = None, evidence_status: str | None = None,

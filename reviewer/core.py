@@ -162,6 +162,8 @@ def init():
         db.executescript('''
         CREATE TABLE IF NOT EXISTS transcriptions(id INTEGER PRIMARY KEY,page_id TEXT REFERENCES pages(id),job_id INTEGER,model TEXT,text TEXT,status TEXT,error TEXT,image_hash TEXT,created TEXT);
         ''')
+        # Index early so the startup backfills below don't scan whole tables.
+        create_indexes(db)
         transcription_columns={r['name'] for r in db.execute('PRAGMA table_info(transcriptions)')}
         if 'compacted_text' not in transcription_columns:
             db.execute('ALTER TABLE transcriptions ADD COLUMN compacted_text TEXT')
@@ -242,13 +244,58 @@ def init():
         # Fill timestamps for batches created before these fields were added.
         db.execute("UPDATE batches SET started_at=created WHERE started_at IS NULL AND status!='queued'")
         db.execute("UPDATE batches SET finished_at=updated WHERE finished_at IS NULL AND status IN ('complete','needs_attention','failed','interrupted')")
-        # Fill timestamps for batches created before these fields were added.
-        db.execute("UPDATE batches SET started_at=created WHERE started_at IS NULL AND status!='queued'")
-        db.execute("UPDATE batches SET finished_at=updated WHERE finished_at IS NULL AND status IN ('complete','needs_attention','failed','interrupted')")
         if 'medgemma_job_id' not in {r['name'] for r in db.execute('PRAGMA table_info(batch_items)')}:
             db.execute('ALTER TABLE batch_items ADD COLUMN medgemma_job_id INTEGER')
         if 'medgemma_candidates' not in {r['name'] for r in db.execute('PRAGMA table_info(batch_items)')}:
             db.execute('ALTER TABLE batch_items ADD COLUMN medgemma_candidates INTEGER DEFAULT 0')
+        create_indexes(db)
+        create_ui_version_triggers(db)
+
+# Status and progress queries are built from correlated subqueries keyed on
+# these columns. Without indexes each subquery is a full table scan, so UI
+# endpoints slow down roughly quadratically as the dataset grows.
+INDEXES = (
+    ('ix_pages_document', 'pages(document_id,number)'),
+    ('ix_transcriptions_page', 'transcriptions(page_id,status,id)'),
+    ('ix_transcriptions_job', 'transcriptions(job_id,status)'),
+    ('ix_runs_page', 'runs(page_id,status)'),
+    ('ix_runs_job', 'runs(job_id,status)'),
+    ('ix_evidence_page', 'evidence(page_id,status)'),
+    ('ix_evidence_run', 'evidence(run_id)'),
+    ('ix_decisions_evidence', 'decisions(evidence_id)'),
+    ('ix_jobs_document', 'jobs(document_id,kind,id)'),
+    ('ix_jobs_status', 'jobs(status)'),
+    ('ix_failed_attempts_job', 'failed_attempts(job_id,page_id)'),
+    ('ix_failed_attempts_page', 'failed_attempts(page_id)'),
+    ('ix_batch_items_batch', 'batch_items(batch_id)'),
+    ('ix_batch_items_document', 'batch_items(document_id)'),
+    ('ix_page_embeddings_page', 'page_embeddings(page_id)'),
+)
+
+def create_indexes(db):
+    tables={r['name'] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for name, target in INDEXES:
+        if target.split('(')[0] in tables:
+            db.execute(f'CREATE INDEX IF NOT EXISTS {name} ON {target}')
+
+# Any write to these tables changes what the UI shows. Triggers bump a single
+# counter in the same transaction, so the browser can poll one cheap value and
+# only refetch when something has actually changed.
+UI_VERSION_TABLES = ('documents', 'pages', 'jobs', 'transcriptions', 'runs', 'evidence',
+                     'decisions', 'failed_attempts', 'batches', 'batch_items', 'semantic_jobs')
+
+def create_ui_version_triggers(db):
+    db.execute('CREATE TABLE IF NOT EXISTS ui_state(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL)')
+    db.execute('INSERT OR IGNORE INTO ui_state(id,version) VALUES(1,0)')
+    for table in UI_VERSION_TABLES:
+        for event in ('INSERT', 'UPDATE', 'DELETE'):
+            db.execute(f'''CREATE TRIGGER IF NOT EXISTS ui_version_{table}_{event.lower()}
+                AFTER {event} ON {table} BEGIN UPDATE ui_state SET version=version+1 WHERE id=1; END''')
+
+def ui_version():
+    with connect() as db:
+        row = db.execute('SELECT version FROM ui_state WHERE id=1').fetchone()
+        return row['version'] if row else 0
 
 def get_setting(key, default=None):
     with connect() as db:
